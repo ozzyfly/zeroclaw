@@ -1,5 +1,6 @@
 use crate::channels::{
     Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
+    WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -351,6 +352,20 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 mm.allowed_users.clone(),
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "whatsapp" => {
+            let wa = config
+                .channels_config
+                .whatsapp
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
+            let channel = WhatsAppChannel::new(
+                wa.access_token.clone().unwrap_or_default(),
+                wa.phone_number_id.clone().unwrap_or_default(),
+                wa.verify_token.clone().unwrap_or_default(),
+                wa.allowed_numbers.clone(),
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }

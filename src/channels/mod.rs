@@ -41,7 +41,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
-pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
+pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
@@ -76,6 +76,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -85,6 +86,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+
+/// Shared WhatsApp Web channel instance used by both the channel listener
+/// and the gateway's `/api/send` endpoint.  The listener populates `self.client`
+/// when it connects; `/api/send` reuses that live client instead of spawning a
+/// disruptive `send_oneshot` session.
+#[cfg(feature = "whatsapp-web")]
+static SHARED_WHATSAPP_WEB: OnceLock<Arc<WhatsAppWebChannel>> = OnceLock::new();
+
+/// Return the shared `WhatsAppWebChannel` singleton (if initialised).
+#[cfg(feature = "whatsapp-web")]
+pub fn shared_whatsapp_web() -> Option<&'static Arc<WhatsAppWebChannel>> {
+    SHARED_WHATSAPP_WEB.get()
+}
 
 /// Per-sender conversation history for channel messages.
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
@@ -145,10 +159,13 @@ struct ChannelRouteSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChannelRuntimeCommand {
+    Ping,
     ShowProviders,
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    ShowInvestmentReport(Option<NaiveDate>),
+    GenerateInvestmentReport,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -453,13 +470,87 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord")
 }
 
-fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    if !supports_runtime_model_switch(channel_name) {
+fn matches_investment_report_keyword(value: &str) -> bool {
+    matches!(value.trim(), "投資日報" | "投资日报")
+}
+
+fn parse_investment_report_date(value: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()
+}
+
+fn parse_investment_report_command(
+    channel_name: &str,
+    trimmed: &str,
+) -> Option<ChannelRuntimeCommand> {
+    if trimmed.starts_with('/') {
+        let mut parts = trimmed.split_whitespace();
+        let command_token = parts.next()?;
+        let base_command = command_token
+            .split('@')
+            .next()
+            .unwrap_or(command_token)
+            .to_ascii_lowercase();
+
+        if matches!(base_command.as_str(), "/invest-report" | "/investreport") {
+            let argument = parts.collect::<Vec<_>>().join(" ");
+            let argument = argument.trim();
+            return match argument {
+                "" | "today" => Some(ChannelRuntimeCommand::ShowInvestmentReport(None)),
+                "run" | "generate" => Some(ChannelRuntimeCommand::GenerateInvestmentReport),
+                _ => parse_investment_report_date(argument)
+                    .map(|date| ChannelRuntimeCommand::ShowInvestmentReport(Some(date))),
+            };
+        }
+
         return None;
     }
 
+    if channel_name != "whatsapp" {
+        return None;
+    }
+
+    let normalized = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if matches!(
+        normalized.as_str(),
+        "生成投資日報" | "生成投资日报" | "現在生成投資日報" | "现在生成投资日报"
+    ) {
+        return Some(ChannelRuntimeCommand::GenerateInvestmentReport);
+    }
+
+    if matches_investment_report_keyword(&normalized) {
+        return Some(ChannelRuntimeCommand::ShowInvestmentReport(None));
+    }
+
+    let parts = normalized.split_whitespace().collect::<Vec<_>>();
+    if parts.len() == 2 {
+        if let Some(date) = parse_investment_report_date(parts[0]) {
+            if matches_investment_report_keyword(parts[1]) {
+                return Some(ChannelRuntimeCommand::ShowInvestmentReport(Some(date)));
+            }
+        }
+
+        if matches_investment_report_keyword(parts[0]) {
+            if let Some(date) = parse_investment_report_date(parts[1]) {
+                return Some(ChannelRuntimeCommand::ShowInvestmentReport(Some(date)));
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
     let trimmed = content.trim();
-    if !trimmed.starts_with('/') {
+    if let Some(command) = parse_investment_report_command(channel_name, trimmed) {
+        return Some(command);
+    }
+
+    // /ping works on every channel regardless of model-switch support.
+    if trimmed.eq_ignore_ascii_case("/ping") {
+        return Some(ChannelRuntimeCommand::Ping);
+    }
+
+    if !supports_runtime_model_switch(channel_name) || !trimmed.starts_with('/') {
         return None;
     }
 
@@ -607,6 +698,81 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
 
     parsed.apply_env_overrides();
     Ok(runtime_defaults_from_config(&parsed))
+}
+
+async fn load_runtime_config_for_commands(ctx: &ChannelRuntimeContext) -> Result<Config> {
+    let Some(config_path) = runtime_config_path(ctx) else {
+        return Config::load_or_init().await;
+    };
+
+    let contents = tokio::fs::read_to_string(&config_path)
+        .await
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let mut parsed: Config = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+    parsed.config_path = config_path.clone();
+    parsed.workspace_dir = config_path
+        .parent()
+        .map(|dir| dir.join("workspace"))
+        .unwrap_or_else(|| ctx.workspace_dir.as_path().to_path_buf());
+    parsed.apply_env_overrides();
+    Ok(parsed)
+}
+
+fn format_stored_investment_report_response(report_date: &str, summary: &str) -> String {
+    format!("📊 投資日報 {report_date}\n\n{}", summary.trim())
+}
+
+fn build_investment_report_missing_response(
+    report_date: &str,
+    latest_date: Option<&str>,
+) -> String {
+    match latest_date {
+        Some(latest) if latest != report_date => format!(
+            "找不到 {report_date} 的投資日報。最新一份 recorder 記錄是 {latest}。若要立刻生成今天的報告，請發送「生成投資日報」。"
+        ),
+        _ => format!(
+            "找不到 {report_date} 的投資日報。這條 deterministic command path 只讀 recorder DB。若要立刻生成，請發送「生成投資日報」。"
+        ),
+    }
+}
+
+async fn generate_investment_report_response(
+    ctx: &ChannelRuntimeContext,
+    current: &ChannelRouteSelection,
+    config: &Config,
+    reporter_config: &crate::integrations::feed_processor::types::InvestReporterConfig,
+    reply_target: &str,
+) -> String {
+    match get_or_create_provider(ctx, &current.provider).await {
+        Ok(provider) => match crate::integrations::investment_reporter::run_daily_report(
+            config,
+            reporter_config,
+            provider.as_ref(),
+            &current.model,
+            ctx.temperature,
+            reply_target,
+            true,
+        )
+        .await
+        {
+            Ok(report) => format_stored_investment_report_response(
+                &report.report_date,
+                &report.whatsapp_summary,
+            ),
+            Err(err) => {
+                let safe_err = providers::sanitize_api_error(&err.to_string());
+                format!("生成投資日報失敗：{safe_err}")
+            }
+        },
+        Err(err) => {
+            let safe_err = providers::sanitize_api_error(&err.to_string());
+            format!(
+                "無法初始化投資日報 provider `{}`：{safe_err}",
+                current.provider
+            )
+        }
+    }
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -980,6 +1146,7 @@ async fn handle_runtime_command_if_needed(
     let mut current = get_route_selection(ctx, &sender_key);
 
     let response = match command {
+        ChannelRuntimeCommand::Ping => "pong".to_string(),
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
@@ -1026,16 +1193,89 @@ async fn handle_runtime_command_if_needed(
                 )
             }
         }
+        ChannelRuntimeCommand::ShowInvestmentReport(date) => {
+            match load_runtime_config_for_commands(ctx).await {
+                Ok(config) => match config.invest_reporter.as_ref().filter(|cfg| cfg.enabled) {
+                    Some(reporter_config) => {
+                        let today_report_date = crate::integrations::investment_reporter::orchestrator::report_date_for_timezone(
+                                &reporter_config.timezone,
+                            );
+                        let report_date = date
+                            .map(|value| value.format("%Y-%m-%d").to_string())
+                            .unwrap_or_else(|| today_report_date.clone());
+                        let should_generate_if_missing =
+                            date.is_none() || report_date == today_report_date;
+
+                        match crate::integrations::investment_reporter::recorder::open_db(&config.workspace_dir)
+                            {
+                                Ok(conn) => {
+                                    match crate::integrations::investment_reporter::recorder::get_report_by_date(&conn, &report_date) {
+                                        Ok(Some(report)) => format_stored_investment_report_response(
+                                            &report.report_date,
+                                            &report.whatsapp_summary,
+                                        ),
+                                        Ok(None) => {
+                                            if should_generate_if_missing {
+                                                generate_investment_report_response(
+                                                    ctx,
+                                                    &current,
+                                                    &config,
+                                                    reporter_config,
+                                                    &msg.reply_target,
+                                                )
+                                                .await
+                                            } else {
+                                                let latest_date = crate::integrations::investment_reporter::recorder::get_latest_report(&conn)
+                                                    .ok()
+                                                    .flatten()
+                                                    .map(|report| report.report_date);
+                                                build_investment_report_missing_response(
+                                                    &report_date,
+                                                    latest_date.as_deref(),
+                                                )
+                                            }
+                                        }
+                                        Err(err) => format!("查詢投資日報失敗：{err}"),
+                                    }
+                                }
+                                Err(err) => format!("無法開啟投資日報資料庫：{err}"),
+                            }
+                    }
+                    None => "invest_reporter 未啟用，無法處理投資日報命令。".to_string(),
+                },
+                Err(err) => format!("無法載入投資日報設定：{err}"),
+            }
+        }
+        ChannelRuntimeCommand::GenerateInvestmentReport => {
+            match load_runtime_config_for_commands(ctx).await {
+                Ok(config) => match config.invest_reporter.as_ref().filter(|cfg| cfg.enabled) {
+                    Some(reporter_config) => {
+                        generate_investment_report_response(
+                            ctx,
+                            &current,
+                            &config,
+                            reporter_config,
+                            &msg.reply_target,
+                        )
+                        .await
+                    }
+                    None => "invest_reporter 未啟用，無法生成投資日報。".to_string(),
+                },
+                Err(err) => format!("無法載入投資日報設定：{err}"),
+            }
+        }
     };
 
-    if let Err(err) = channel
-        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
-        .await
-    {
-        tracing::warn!(
-            "Failed to send runtime command response on {}: {err}",
-            channel.name()
-        );
+    if !response.is_empty() {
+        if let Err(err) = channel
+            .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+            .await
+        {
+            tracing::warn!(
+                "Failed to send runtime command response on {}: {err}",
+                channel.name()
+            );
+        }
     }
 
     true
@@ -1385,19 +1625,43 @@ fn spawn_supervised_listener_with_health_interval(
         let max_backoff = max_backoff_secs.max(backoff);
 
         loop {
-            crate::health::mark_component_ok(&component);
             let mut health = tokio::time::interval(health_interval);
             health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let result = {
-                let listen_future = ch.listen(tx.clone());
-                tokio::pin!(listen_future);
+            health.tick().await;
+            let listener = {
+                let ch = Arc::clone(&ch);
+                let tx = tx.clone();
+                tokio::spawn(async move { ch.listen(tx).await })
+            };
+            tokio::pin!(listener);
 
-                loop {
-                    tokio::select! {
-                        _ = health.tick() => {
+            let result = loop {
+                tokio::select! {
+                    _ = health.tick() => {
+                        if ch.health_check().await {
                             crate::health::mark_component_ok(&component);
+                        } else {
+                            let message = format!("{} health check failed while listener was running", ch.name());
+                            tracing::warn!("{}", message);
+                            crate::health::mark_component_error(&component, &message);
+                            listener.as_mut().abort();
+                            let _ = listener.await;
+                            break Err(anyhow::anyhow!(message));
                         }
-                        result = &mut listen_future => break result,
+                    }
+                    join_result = &mut listener => {
+                        break match join_result {
+                            Ok(result) => result,
+                            Err(err) if err.is_cancelled() => Err(anyhow::anyhow!(
+                                "{} listener task cancelled",
+                                ch.name()
+                            )),
+                            Err(err) => Err(anyhow::anyhow!(
+                                "{} listener task join error: {}",
+                                ch.name(),
+                                err
+                            )),
+                        };
                     }
                 }
             };
@@ -1557,6 +1821,21 @@ async fn process_channel_message(
                 None,
             )
             .await;
+    }
+
+    // ── Deterministic trigger: Spotify podcast on-demand ──
+    // Bypass LLM tool-calling (unreliable for fire-and-forget shell commands)
+    // and spawn the summarizer script directly when a "Pc:" + Spotify URL is detected.
+    if let Some(spotify_url) = crate::gateway::extract_spotify_podcast_url(&msg.content) {
+        crate::gateway::spawn_podcast_summarizer(&spotify_url, &msg.channel, &msg.reply_target);
+        let ack = "收到！正在處理緊呢條新連結，等陣就有結果～ 🎧";
+        println!("  🎧 Podcast trigger: {spotify_url}");
+        if let Some(channel) = target_channel.as_ref() {
+            let _ = channel
+                .send(&SendMessage::new(ack, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+                .await;
+        }
+        return;
     }
 
     println!("  ⏳ Processing message...");
@@ -1855,7 +2134,10 @@ async fn process_channel_message(
             // added during run_tool_call_loop, so the LLM retains awareness
             // of what it did on subsequent turns.
             let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
+            let history_response = if tool_summary.is_empty()
+                || msg.channel == "telegram"
+                || msg.channel == "whatsapp"
+            {
                 delivered_response.clone()
             } else {
                 format!("{tool_summary}\n{delivered_response}")
@@ -2779,14 +3061,17 @@ fn collect_configured_channels(
                 // Web mode: requires session_path
                 #[cfg(feature = "whatsapp-web")]
                 if wa.is_web_config() {
-                    channels.push(ConfiguredChannel {
-                        display_name: "WhatsApp",
-                        channel: Arc::new(WhatsAppWebChannel::new(
+                    let shared = Arc::clone(SHARED_WHATSAPP_WEB.get_or_init(|| {
+                        Arc::new(WhatsAppWebChannel::new(
                             wa.session_path.clone().unwrap_or_default(),
                             wa.pair_phone.clone(),
                             wa.pair_code.clone(),
                             wa.allowed_numbers.clone(),
-                        )),
+                        ))
+                    }));
+                    channels.push(ConfiguredChannel {
+                        display_name: "WhatsApp",
+                        channel: shared,
                     });
                 } else {
                     tracing::warn!("WhatsApp Web configured but session_path not set");
@@ -3270,6 +3555,7 @@ mod tests {
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
+    use async_trait::async_trait;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -3610,10 +3896,45 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct WhatsAppRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
             "telegram"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for WhatsAppRecordingChannel {
+        fn name(&self) -> &str {
+            "whatsapp"
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -6194,6 +6515,36 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    struct UnhealthyWhileRunningChannel {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        healthy: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Channel for UnhealthyWhileRunningChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tx.closed().await;
+            Ok(())
+        }
+
+        async fn health_check(&self) -> bool {
+            self.healthy.load(Ordering::SeqCst)
+        }
+    }
+
     #[async_trait::async_trait]
     impl Channel for BlockUntilClosedChannel {
         fn name(&self) -> &str {
@@ -6286,6 +6637,48 @@ This is an example JSON object for profile settings."#;
         assert!(calls.load(Ordering::SeqCst) >= 1);
     }
 
+    #[tokio::test]
+    async fn supervised_listener_restarts_when_health_check_fails() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let healthy = Arc::new(AtomicBool::new(true));
+        let channel_name = format!("test-supervised-unhealthy-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let channel: Arc<dyn Channel> = Arc::new(UnhealthyWhileRunningChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            healthy: Arc::clone(&healthy),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+        );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        healthy.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let snapshot = crate::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_eq!(component["status"], "error");
+        assert!(component["last_error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("health check failed"));
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "listener should restart after health failure"
+        );
+
+        drop(rx);
+        handle.abort();
+        let _ = handle.await;
+    }
+
     #[test]
     fn maybe_restart_daemon_systemd_args_regression() {
         assert_eq!(
@@ -6302,6 +6695,209 @@ This is an example JSON object for profile settings."#;
     fn maybe_restart_daemon_openrc_args_regression() {
         assert_eq!(OPENRC_STATUS_ARGS, ["zeroclaw", "status"]);
         assert_eq!(OPENRC_RESTART_ARGS, ["zeroclaw", "restart"]);
+    }
+
+    #[test]
+    fn parse_runtime_command_matches_whatsapp_investment_report_variants() {
+        assert_eq!(
+            parse_runtime_command("whatsapp", "投資日報"),
+            Some(ChannelRuntimeCommand::ShowInvestmentReport(None))
+        );
+        assert_eq!(
+            parse_runtime_command("whatsapp", "2026-03-11 投資日報"),
+            Some(ChannelRuntimeCommand::ShowInvestmentReport(Some(
+                NaiveDate::from_ymd_opt(2026, 3, 11).unwrap(),
+            )))
+        );
+        assert_eq!(
+            parse_runtime_command("whatsapp", "生成投資日報"),
+            Some(ChannelRuntimeCommand::GenerateInvestmentReport)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/invest-report 2026-03-11"),
+            Some(ChannelRuntimeCommand::ShowInvestmentReport(Some(
+                NaiveDate::from_ymd_opt(2026, 3, 11).unwrap(),
+            )))
+        );
+    }
+
+    async fn write_runtime_command_test_config(zeroclaw_dir: &std::path::Path) {
+        let mut config = crate::config::Config::default();
+        config.config_path = zeroclaw_dir.join("config.toml");
+        config.workspace_dir = zeroclaw_dir.join("workspace");
+        config.invest_reporter = Some(
+            crate::integrations::feed_processor::types::InvestReporterConfig {
+                enabled: true,
+                timezone: "Asia/Taipei".to_string(),
+                ..Default::default()
+            },
+        );
+        config.save().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn whatsapp_investment_report_command_uses_recorder_without_provider_call() {
+        let tmp = TempDir::new().unwrap();
+        let zeroclaw_dir = tmp.path().join(".zeroclaw");
+        std::fs::create_dir_all(&zeroclaw_dir).unwrap();
+        write_runtime_command_test_config(&zeroclaw_dir).await;
+
+        let workspace_dir = zeroclaw_dir.join("workspace");
+        let conn =
+            crate::integrations::investment_reporter::recorder::open_db(&workspace_dir).unwrap();
+        crate::integrations::investment_reporter::recorder::save_report(
+            &conn,
+            "2026-03-11",
+            "{}",
+            "來自 recorder DB 的摘要",
+            2,
+            3,
+        )
+        .unwrap();
+
+        let channel_impl = Arc::new(WhatsAppRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(zeroclaw_dir),
+                ..Default::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "wa-invest-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-invest".to_string(),
+                content: "2026-03-11 投資日報".to_string(),
+                channel: "whatsapp".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let provider_calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            provider_calls.is_empty(),
+            "lookup should bypass the LLM provider"
+        );
+        drop(provider_calls);
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("📊 投資日報 2026-03-11"));
+        assert!(sent_messages[0].contains("來自 recorder DB 的摘要"));
+    }
+
+    #[tokio::test]
+    async fn whatsapp_investment_report_command_generates_today_when_db_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let zeroclaw_dir = tmp.path().join(".zeroclaw");
+        std::fs::create_dir_all(&zeroclaw_dir).unwrap();
+        write_runtime_command_test_config(&zeroclaw_dir).await;
+
+        let channel_impl = Arc::new(WhatsAppRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(zeroclaw_dir),
+                ..Default::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "wa-invest-missing-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-invest".to_string(),
+                content: "投資日報".to_string(),
+                channel: "whatsapp".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let provider_calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            provider_calls.is_empty(),
+            "generation should fail before any LLM call when no sources exist"
+        );
+        drop(provider_calls);
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("生成投資日報失敗"));
+        assert!(!sent_messages[0].contains("只讀 recorder DB"));
     }
 
     #[test]

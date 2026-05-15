@@ -1,0 +1,53 @@
+# ZeroClaw Production Deployment
+#
+# This is the production Docker Compose configuration for ZeroClaw.
+# Use with the deploy script (deploy.sh) for automated rollouts.
+#
+# Usage:
+#   1. Copy .env.example to .env and set your API key
+#   2. Run: docker compose -f docker-compose.prod.yml up -d
+#   3. Gateway is available at http://127.0.0.1:42617
+
+services:
+  zeroclaw:
+    image: ghcr.io/zeroclaw-labs/zeroclaw:latest
+    container_name: zeroclaw
+    restart: unless-stopped
+
+    environment:
+      - API_KEY=${API_KEY:-}
+      - PROVIDER=${PROVIDER:-openrouter}
+      - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+      - ZEROCLAW_GATEWAY_PORT=42617
+
+    volumes:
+      - zeroclaw-data:/zeroclaw-data
+
+    ports:
+      # Bind to localhost only — do NOT expose publicly
+      - "127.0.0.1:42617:42617"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    healthcheck:
+      test: ["CMD", "zeroclaw", "status"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  zeroclaw-data:

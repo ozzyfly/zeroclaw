@@ -197,8 +197,20 @@ Examples:
         /// Optional IANA timezone (e.g. America/Los_Angeles)
         #[arg(long)]
         tz: Option<String>,
-        /// Command to run
+        /// Shell command to run (ignored when --prompt is set)
         command: String,
+        /// Agent prompt (when set, creates an agent job instead of a shell job)
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Model override for agent jobs (e.g. claude-sonnet-4-6)
+        #[arg(long)]
+        model: Option<String>,
+        /// Job name
+        #[arg(long)]
+        name: Option<String>,
+        /// Deliver output to channel:target (e.g. whatsapp:+1234567890, telegram:12345)
+        #[arg(long)]
+        deliver_to: Option<String>,
     },
     /// Add a one-shot scheduled task at an RFC3339 timestamp
     #[command(long_about = "\
@@ -277,6 +289,15 @@ Examples:
         /// New job name
         #[arg(long)]
         name: Option<String>,
+        /// New agent prompt
+        #[arg(long)]
+        prompt: Option<String>,
+        /// New model override
+        #[arg(long)]
+        model: Option<String>,
+        /// Deliver output to channel:target (e.g. whatsapp:+1234567890)
+        #[arg(long)]
+        deliver_to: Option<String>,
     },
     /// Pause a scheduled task
     Pause {

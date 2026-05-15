@@ -651,7 +651,12 @@ impl SecurityPolicy {
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
         if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
+            return Err(format!(
+                "Command not allowed by security policy. Only these commands are allowed: {:?}. \
+                 Do NOT use osascript or AppleScript. \
+                 For calendar operations, use: ~/.zeroclaw/venv/bin/python /Users/user/open-skills/skills/google-calendar-integration/google_calendar.py <subcommand>",
+                self.allowed_commands
+            ));
         }
 
         let risk = self.command_risk_level(command);
@@ -899,9 +904,19 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
+        // Block absolute paths when workspace_only is set, unless the path
+        // falls under an allowed root (e.g. a shared skills directory).
+        // This mirrors the intent of `allowed_roots` in `is_resolved_path_allowed`.
         if self.workspace_only && expanded_path.is_absolute() {
-            return false;
+            let workspace_expanded = expand_user_path(self.workspace_dir.to_str().unwrap_or(""));
+            let under_workspace = expanded_path.starts_with(&workspace_expanded);
+            let under_allowed_root = self.allowed_roots.iter().any(|root| {
+                let root_expanded = expand_user_path(root.to_str().unwrap_or(""));
+                expanded_path.starts_with(&root_expanded)
+            });
+            if !under_workspace && !under_allowed_root {
+                return false;
+            }
         }
 
         // Block forbidden paths using path-component-aware matching
@@ -2156,6 +2171,27 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_path_allowed_allows_absolute_path_under_allowed_root() {
+        let policy = SecurityPolicy {
+            workspace_only: true,
+            allowed_roots: vec![PathBuf::from("/Users/user/open-skills")],
+            ..SecurityPolicy::default()
+        };
+        // Path under allowed_root must pass even with workspace_only = true
+        assert!(
+            policy.is_path_allowed(
+                "/Users/user/open-skills/skills/google-calendar-integration/google_calendar.py"
+            ),
+            "path under allowed_root must be allowed"
+        );
+        // Path outside workspace and allowed_roots must still be blocked
+        assert!(
+            !policy.is_path_allowed("/Users/user/other/secret.txt"),
+            "path outside workspace and allowed_roots must be blocked"
+        );
     }
 
     #[test]

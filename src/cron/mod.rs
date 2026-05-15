@@ -58,16 +58,54 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             expression,
             tz,
             command,
+            prompt,
+            model,
+            name,
+            deliver_to,
         } => {
             let schedule = Schedule::Cron {
                 expr: expression,
                 tz,
             };
-            let job = add_shell_job(config, None, schedule, &command)?;
+            let delivery = deliver_to.map(|dt| parse_deliver_to(&dt)).transpose()?;
+            let job = if let Some(ref agent_prompt) = prompt {
+                add_agent_job(
+                    config,
+                    name,
+                    schedule,
+                    agent_prompt,
+                    SessionTarget::Isolated,
+                    model,
+                    delivery,
+                    false,
+                )?
+            } else {
+                if command.is_empty() {
+                    bail!("Either a command or --prompt must be provided");
+                }
+                let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+                if !security.is_command_allowed(&command) {
+                    bail!("Command blocked by security policy: {command}");
+                }
+                let mut job = add_shell_job(config, name, schedule, &command)?;
+                if let Some(d) = delivery {
+                    let patch = CronJobPatch {
+                        delivery: Some(d),
+                        ..CronJobPatch::default()
+                    };
+                    job = update_job(config, &job.id, patch)?;
+                }
+                job
+            };
             println!("✅ Added cron job {}", job.id);
+            println!("  Type: {:?}", job.job_type);
             println!("  Expr: {}", job.expression);
             println!("  Next: {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            if job.prompt.is_some() {
+                println!("  Prompt: (agent job)");
+            } else {
+                println!("  Cmd : {}", job.command);
+            }
             Ok(())
         }
         crate::CronCommands::AddAt { at, command } => {
@@ -103,9 +141,19 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             tz,
             command,
             name,
+            prompt,
+            model,
+            deliver_to,
         } => {
-            if expression.is_none() && tz.is_none() && command.is_none() && name.is_none() {
-                bail!("At least one of --expression, --tz, --command, or --name must be provided");
+            if expression.is_none()
+                && tz.is_none()
+                && command.is_none()
+                && name.is_none()
+                && prompt.is_none()
+                && model.is_none()
+                && deliver_to.is_none()
+            {
+                bail!("At least one update flag must be provided (--expression, --tz, --command, --name, --prompt, --model, --deliver-to)");
             }
 
             // Merge expression/tz with the existing schedule so that
@@ -135,10 +183,15 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 }
             }
 
+            let delivery = deliver_to.map(|dt| parse_deliver_to(&dt)).transpose()?;
+
             let patch = CronJobPatch {
                 schedule,
                 command,
+                prompt,
                 name,
+                delivery,
+                model,
                 ..CronJobPatch::default()
             };
 
@@ -146,7 +199,11 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             println!("\u{2705} Updated cron job {}", job.id);
             println!("  Expr: {}", job.expression);
             println!("  Next: {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            if job.prompt.is_some() {
+                println!("  Prompt: (agent job)");
+            } else {
+                println!("  Cmd : {}", job.command);
+            }
             Ok(())
         }
         crate::CronCommands::Remove { id } => remove_job(config, &id),
@@ -161,6 +218,21 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             Ok(())
         }
     }
+}
+
+/// Parse a `--deliver-to` value in `channel:target` format into a `DeliveryConfig`.
+///
+/// Examples: `whatsapp:+1234567890`, `telegram:12345`, `slack:#general`
+fn parse_deliver_to(value: &str) -> Result<DeliveryConfig> {
+    let (channel, target) = value.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("--deliver-to must be in channel:target format (e.g. whatsapp:+1234567890)")
+    })?;
+    Ok(DeliveryConfig {
+        mode: "announce".to_string(),
+        channel: Some(channel.to_string()),
+        to: Some(target.to_string()),
+        best_effort: true,
+    })
 }
 
 pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
@@ -264,6 +336,9 @@ mod tests {
                 tz: tz.map(Into::into),
                 command: command.map(Into::into),
                 name: name.map(Into::into),
+                prompt: None,
+                model: None,
+                deliver_to: None,
             },
             config,
         )
@@ -386,7 +461,10 @@ mod tests {
 
         let result = run_update(&config, &job.id, None, None, None, None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("At least one of"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("At least one update flag must be provided"));
     }
 
     #[test]
