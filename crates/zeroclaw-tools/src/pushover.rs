@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
@@ -21,7 +21,7 @@ impl PushoverTool {
         }
     }
 
-    fn parse_env_value(raw: &str) -> String {
+    pub(crate) fn parse_env_value(raw: &str) -> String {
         let raw = raw.trim();
 
         let unquoted = if raw.len() >= 2
@@ -211,6 +211,63 @@ impl Tool for PushoverTool {
                 error: Some("Pushover API returned an application-level error".into()),
             })
         }
+    }
+}
+
+/// Send a best-effort Pushover notification without going through the tool
+/// system.  Intended for internal alerts (e.g., WhatsApp session expired).
+/// Silently logs on failure — never panics or propagates errors.
+pub async fn send_pushover_alert(workspace_dir: &Path, title: &str, message: &str) {
+    let env_path = workspace_dir.join(".env");
+    let content = match tokio::fs::read_to_string(&env_path).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let mut token = None;
+    let mut user_key = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
+        if let Some((key, value)) = line.split_once('=') {
+            let value = PushoverTool::parse_env_value(value);
+            match key.trim() {
+                "PUSHOVER_TOKEN" => token = Some(value),
+                "PUSHOVER_USER_KEY" => user_key = Some(value),
+                _ => {}
+            }
+        }
+    }
+
+    let (Some(token), Some(user_key)) = (token, user_key) else {
+        return;
+    };
+
+    let form = reqwest::multipart::Form::new()
+        .text("token", token)
+        .text("user", user_key)
+        .text("message", message.to_string())
+        .text("title", title.to_string())
+        .text("priority", "1");
+
+    let client = zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        "alert.pushover",
+        PUSHOVER_REQUEST_TIMEOUT_SECS,
+        10,
+    );
+
+    match client.post(PUSHOVER_API_URL).multipart(form).send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                tracing::info!("Pushover alert sent: {title}");
+            } else {
+                tracing::warn!("Pushover alert failed (HTTP {}): {title}", resp.status());
+            }
+        }
+        Err(e) => tracing::warn!("Pushover alert request failed: {e}"),
     }
 }
 
