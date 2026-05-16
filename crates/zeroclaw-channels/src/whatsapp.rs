@@ -204,9 +204,35 @@ impl WhatsAppChannel {
         )
     }
 
-    /// Check if a phone number is allowed (E.164 format: +1234567890)
+    /// Check if a phone number is allowed (E.164 format: +1234567890).
+    /// Both sides are normalised first so allowlist entries can be written
+    /// with or without `+` / formatting and so LID-style `<digits>@<jid>`
+    /// inputs match a `+<digits>` allowlist entry.
     fn is_number_allowed(&self, phone: &str) -> bool {
-        self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
+        let normalized_phone = Self::normalize_phone(phone);
+        self.allowed_numbers
+            .iter()
+            .any(|n| n == "*" || Self::normalize_phone(n) == normalized_phone)
+    }
+
+    /// Reduce a phone-number-shaped string to E.164 form (`+<digits>`).
+    /// Strips an `@<jid>` suffix (so LID and `<phone>@s.whatsapp.net` inputs
+    /// reduce to the bare phone) and discards any non-digit punctuation.
+    /// If no digits remain, returns the original `user_part` so the caller
+    /// can still log something sensible.
+    fn normalize_phone(phone: &str) -> String {
+        let trimmed = phone.trim();
+        let user_part = trimmed
+            .split_once('@')
+            .map(|(user, _)| user)
+            .unwrap_or(trimmed);
+        let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
+
+        if digits.is_empty() {
+            user_part.to_string()
+        } else {
+            format!("+{digits}")
+        }
     }
 
     /// Get the verify token for webhook verification
@@ -246,11 +272,7 @@ impl WhatsAppChannel {
                     };
 
                     // Check allowlist
-                    let normalized_from = if from.starts_with('+') {
-                        from.to_string()
-                    } else {
-                        format!("+{from}")
-                    };
+                    let normalized_from = Self::normalize_phone(from);
 
                     if !self.is_number_allowed(&normalized_from) {
                         tracing::warn!(
@@ -327,6 +349,78 @@ impl WhatsAppChannel {
 
         messages
     }
+
+    /// Perform a health check against the Meta Graph API with 3-attempt
+    /// exponential backoff. Returns Ok on success, Err with diagnostic
+    /// message after MAX_RETRIES failures. Used by `listen()` to drive
+    /// supervisor restart on terminal failures; the `Channel::health_check`
+    /// trait method remains a single-shot bool for compatibility.
+    async fn health_check_with_detailed_logging(&self) -> anyhow::Result<()> {
+        const MAX_RETRIES: u32 = 3;
+        let mut backoff_secs = 1u64;
+
+        for attempt in 1..=MAX_RETRIES {
+            let url = format!("https://graph.facebook.com/v18.0/{}", self.endpoint_id);
+
+            if ensure_https(&url).is_err() {
+                anyhow::bail!("Invalid HTTPS URL configuration");
+            }
+
+            match self
+                .http_client()
+                .get(&url)
+                .bearer_auth(&self.access_token)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        tracing::debug!(
+                            "WhatsApp API health check: {status} (attempt {attempt}/{MAX_RETRIES})"
+                        );
+                        return Ok(());
+                    } else if status.is_client_error() {
+                        let err_body = resp.text().await.unwrap_or_default();
+                        tracing::warn!(
+                            "WhatsApp API health check failed with client error: {status} (attempt {attempt}/{MAX_RETRIES}). \
+                            Check access token and endpoint ID. Error: {err_body}"
+                        );
+                    } else if status.is_server_error() {
+                        tracing::warn!(
+                            "WhatsApp API health check failed with server error: {status} (attempt {attempt}/{MAX_RETRIES}). \
+                            Meta service may be experiencing issues."
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "WhatsApp API health check encountered network error (attempt {attempt}/{MAX_RETRIES}): {e}. \
+                        This may indicate connection issues."
+                    );
+                    if attempt == MAX_RETRIES {
+                        return Err(anyhow::anyhow!(
+                            "Network error during health check after {MAX_RETRIES} attempts: {e}"
+                        ));
+                    }
+                }
+            }
+
+            if attempt < MAX_RETRIES {
+                tracing::info!("Retrying health check in {backoff_secs} seconds...");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs *= 2;
+            }
+        }
+
+        anyhow::bail!(
+            "WhatsApp health check failed after {MAX_RETRIES} attempts. \
+            Please verify: 1) Internet connectivity, \
+            2) WhatsApp access token validity (may have expired), \
+            3) Phone number ID / endpoint ID configuration, \
+            4) Meta API service status"
+        )
+    }
 }
 
 #[async_trait]
@@ -342,11 +436,20 @@ impl Channel for WhatsAppChannel {
             self.endpoint_id
         );
 
-        // Normalize recipient (remove leading + if present for API)
-        let to = message
-            .recipient
-            .strip_prefix('+')
-            .unwrap_or(&message.recipient);
+        let normalized_recipient = Self::normalize_phone(&message.recipient);
+        if !self.is_number_allowed(&normalized_recipient) {
+            tracing::warn!(
+                "WhatsApp: refusing to send to unauthorized recipient: {}",
+                message.recipient
+            );
+            anyhow::bail!(
+                "WhatsApp recipient {} is not in channels_config.whatsapp.allowed_numbers",
+                message.recipient
+            );
+        }
+
+        // Meta expects digits only, without leading +.
+        let to = normalized_recipient.trim_start_matches('+');
 
         let body = serde_json::json!({
             "messaging_product": "whatsapp",
@@ -361,23 +464,68 @@ impl Channel for WhatsAppChannel {
 
         ensure_https(&url)?;
 
-        let resp = self
-            .http_client()
-            .post(&url)
-            .bearer_auth(&self.access_token)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        // Retry logic for transient failures: retry on 5xx and on network
+        // errors, never on 4xx.
+        const MAX_RETRIES: u32 = 2;
+        let mut backoff_secs = 1u64;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_body = resp.text().await.unwrap_or_default();
-            tracing::error!("WhatsApp send failed: {status} — {error_body}");
-            anyhow::bail!("WhatsApp API error: {status}");
+        for attempt in 1..=MAX_RETRIES {
+            match self
+                .http_client()
+                .post(&url)
+                .bearer_auth(&self.access_token)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        tracing::debug!("WhatsApp message sent successfully to {to}");
+                        return Ok(());
+                    } else if status.is_server_error() && attempt < MAX_RETRIES {
+                        let error_body = resp.text().await.unwrap_or_default();
+                        tracing::warn!(
+                            "WhatsApp send failed with server error {status} (attempt {attempt}/{MAX_RETRIES}): {error_body}. \
+                            Will retry in {backoff_secs} seconds."
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs *= 2;
+                    } else {
+                        let error_body = resp.text().await.unwrap_or_default();
+                        let error_msg = if status.is_client_error() {
+                            format!(
+                                "WhatsApp send failed with client error {status}. \
+                                Check: 1) Recipient number format (+country_code_number), \
+                                2) Access token validity, 3) Endpoint ID. Error: {error_body}"
+                            )
+                        } else {
+                            format!("WhatsApp API error: {status} — {error_body}")
+                        };
+                        tracing::error!("{}", error_msg);
+                        anyhow::bail!("{}", error_msg);
+                    }
+                }
+                Err(e) => {
+                    if attempt < MAX_RETRIES {
+                        tracing::warn!(
+                            "WhatsApp send network error (attempt {attempt}/{MAX_RETRIES}): {e}. \
+                            Will retry in {backoff_secs} seconds."
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs *= 2;
+                    } else {
+                        tracing::error!("WhatsApp send failed after {MAX_RETRIES} attempts: {e}");
+                        anyhow::bail!(
+                            "Failed to send WhatsApp message after {MAX_RETRIES} attempts: {e}"
+                        );
+                    }
+                }
+            }
         }
 
-        Ok(())
+        anyhow::bail!("Unexpected: WhatsApp send loop ended without result")
     }
 
     async fn request_approval(
@@ -413,15 +561,24 @@ impl Channel for WhatsAppChannel {
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         // WhatsApp uses webhooks (push-based), not polling.
         // Messages are received via the gateway's /whatsapp endpoint.
-        // This method keeps the channel "alive" but doesn't actively poll.
+        // This method keeps the channel "alive" and actively monitors
+        // connectivity so the supervisor can restart on terminal failure.
         tracing::info!(
             "WhatsApp channel active (webhook mode). \
-            Configure Meta webhook to POST to your gateway's /whatsapp endpoint."
+            Configure Meta webhook to POST to your gateway's /whatsapp endpoint. \
+            Health checks run every 60 seconds to detect connection issues."
         );
 
-        // Keep the task alive — it will be cancelled when the channel shuts down
+        let mut health_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            health_interval.tick().await;
+            if let Err(e) = self.health_check_with_detailed_logging().await {
+                tracing::error!("WhatsApp health check failed: {e}");
+                return Err(e);
+            }
+            tracing::debug!("WhatsApp health check passed");
         }
     }
 
