@@ -1,4 +1,8 @@
+pub mod feed_processor;
+pub mod investment_reporter;
 pub mod registry;
+pub mod transcription;
+pub mod youtube;
 
 use crate::config::Config;
 use anyhow::Result;

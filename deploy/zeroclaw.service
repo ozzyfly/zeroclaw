@@ -1,0 +1,35 @@
+# ZeroClaw AI Agent Runtime — systemd service unit
+#
+# Install:
+#   sudo cp zeroclaw.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#
+# Usage:
+#   sudo systemctl enable zeroclaw   # start on boot
+#   sudo systemctl start zeroclaw    # start now
+#   sudo systemctl stop zeroclaw     # stop
+#   sudo systemctl restart zeroclaw  # restart
+#   sudo systemctl status zeroclaw   # check status
+
+[Unit]
+Description=ZeroClaw AI Agent Runtime
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/zeroclaw
+ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f docker-compose.prod.yml down
+ExecReload=/bin/sh -c '/usr/bin/docker compose -f docker-compose.prod.yml pull && /usr/bin/docker compose -f docker-compose.prod.yml up -d --remove-orphans'
+Restart=on-failure
+RestartSec=10
+User=zeroclaw
+Group=docker
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zeroclaw
+
+[Install]
+WantedBy=multi-user.target

@@ -12,6 +12,8 @@ pub mod sse;
 pub mod static_files;
 pub mod ws;
 
+#[cfg(feature = "whatsapp-web")]
+use crate::channels::WhatsAppWebChannel;
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::cost::CostTracker;
@@ -58,6 +60,93 @@ fn webhook_memory_key() -> String {
 
 fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
+}
+
+/// Extract a Spotify episode URL from a "Pc:" prefixed message.
+/// Returns `Some(url)` when the message is a podcast-on-demand trigger.
+pub fn extract_spotify_podcast_url(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    // Normalise prefix: "pc:" / "pc：" / "Pc:" / "PC:" etc., optional space after colon
+    let after_prefix = {
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("pc:") || lower.starts_with("pc\u{ff1a}") {
+            // skip "pc" + colon (ASCII or fullwidth)
+            let skip = if trimmed.as_bytes().get(2) == Some(&b':') {
+                3
+            } else {
+                5
+            }; // fullwidth ： is 3 UTF-8 bytes
+            Some(trimmed[skip..].trim_start().to_string())
+        } else {
+            None
+        }
+    };
+    let url_source = after_prefix.as_deref().unwrap_or(trimmed);
+    // Find open.spotify.com/episode URL anywhere in the text
+    if let Some(start) = url_source.find("https://open.spotify.com/episode/") {
+        let url_part = &url_source[start..];
+        // Take until whitespace
+        let end = url_part.find(char::is_whitespace).unwrap_or(url_part.len());
+        let url = &url_part[..end];
+        // Strip tracking params (?si=...) for cleaner processing
+        let clean = url.split('?').next().unwrap_or(url);
+        if clean.len() > "https://open.spotify.com/episode/".len() {
+            return Some(clean.to_string());
+        }
+    }
+    None
+}
+
+/// Spawn the on-demand podcast summarizer script in the background.
+/// The script sends results back via the originating channel (telegram/whatsapp)
+/// to the given recipient. Logs are appended to `~/.zeroclaw/logs/spotify_podcast.log`.
+/// A 30-minute watchdog kills the child if it hangs.
+pub fn spawn_podcast_summarizer(spotify_url: &str, channel: &str, recipient: &str) {
+    let log_path = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(".zeroclaw/logs/spotify_podcast.log");
+    let log_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("Failed to open podcast log {}: {e}", log_path.display());
+            return;
+        }
+    };
+    let stderr_file = log_file
+        .try_clone()
+        .unwrap_or_else(|_| log_file.try_clone().unwrap());
+
+    let script = format!(
+        "/Users/user/.zeroclaw/venv/bin/python /Users/user/.zeroclaw/workspace/scripts/spotify_podcast.py --bg --channel '{}' --to '{}' '{}'",
+        channel.replace('\'', "'\\''"),
+        recipient.replace('\'', "'\\''"),
+        spotify_url.replace('\'', "'\\''")
+    );
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .stdout(log_file)
+        .stderr(stderr_file)
+        .spawn()
+    {
+        Ok(mut child) => {
+            tracing::info!("Spawned podcast summarizer for {spotify_url}");
+            // Watchdog: kill after 30 minutes to prevent zombie processes
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(30 * 60));
+                if let Ok(None) = child.try_wait() {
+                    tracing::warn!("Podcast summarizer timed out after 30 min, killing");
+                    let _ = child.kill();
+                }
+            });
+        }
+        Err(e) => tracing::error!("Failed to spawn podcast summarizer: {e}"),
+    }
 }
 
 fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
@@ -303,6 +392,12 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// WhatsApp Web config for outbound send (session_path, pair_phone, pair_code, allowed)
+    #[cfg(feature = "whatsapp-web")]
+    pub whatsapp_web: Option<Arc<WhatsAppWebChannel>>,
+    /// Stub field when whatsapp-web feature is disabled
+    #[cfg(not(feature = "whatsapp-web"))]
+    pub whatsapp_web: Option<()>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -412,7 +507,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             })
         });
 
-    // WhatsApp channel (if configured)
+    // WhatsApp Web channel — reuse the shared singleton so /api/send goes through
+    // the daemon's live connection instead of spawning a disruptive send_oneshot session.
+    #[cfg(feature = "whatsapp-web")]
+    let whatsapp_web_channel: Option<Arc<WhatsAppWebChannel>> =
+        crate::channels::shared_whatsapp_web().cloned();
+    #[cfg(not(feature = "whatsapp-web"))]
+    let whatsapp_web_channel: Option<()> = None;
+
+    // WhatsApp Cloud API channel (if configured)
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
         .channels_config
         .whatsapp
@@ -620,6 +723,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tools_registry,
         cost_tracker,
         event_tx,
+        whatsapp_web: whatsapp_web_channel,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -653,6 +757,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
+        .route("/api/send", post(handle_api_send))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
@@ -1026,6 +1131,132 @@ async fn handle_webhook(
     }
 }
 
+/// Request body for POST /api/send
+#[derive(serde::Deserialize)]
+pub struct ApiSendBody {
+    /// The message text to send
+    pub message: String,
+    /// Channel to send through (currently only "whatsapp")
+    pub channel: String,
+    /// Recipient identifier (phone number for WhatsApp, e.g. "+12345678901")
+    pub to: String,
+}
+
+/// POST /api/send — send an outbound message through a channel
+///
+/// Requires bearer token authentication (same as /webhook).
+/// Currently supports WhatsApp Web channel only.
+async fn handle_api_send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<ApiSendBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    // ── Bearer token auth ──
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            let err = serde_json::json!({"error": "Unauthorized — pair first via POST /pair"});
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+    }
+
+    let Json(send_body) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({
+                "error": format!("Invalid JSON: {e}. Expected: {{\"message\": \"...\", \"channel\": \"whatsapp\", \"to\": \"+1234567890\"}}")
+            });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    match send_body.channel.to_ascii_lowercase().as_str() {
+        "whatsapp" => {
+            #[cfg(feature = "whatsapp-web")]
+            {
+                // Look up the shared instance at request time (not startup) so
+                // the gateway can use the channel even if it started first.
+                let wa_web = state
+                    .whatsapp_web
+                    .clone()
+                    .or_else(|| crate::channels::shared_whatsapp_web().cloned());
+                let Some(wa_web) = wa_web else {
+                    // Try Cloud API fallback
+                    if let Some(ref wa_cloud) = state.whatsapp {
+                        match wa_cloud
+                            .send(&SendMessage::new(&send_body.message, &send_body.to))
+                            .await
+                        {
+                            Ok(()) => {
+                                let body = serde_json::json!({"status": "sent", "channel": "whatsapp-cloud"});
+                                return (StatusCode::OK, Json(body));
+                            }
+                            Err(e) => {
+                                let err = serde_json::json!({"error": format!("WhatsApp Cloud send failed: {e}")});
+                                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+                            }
+                        }
+                    }
+                    let err = serde_json::json!({
+                        "error": "WhatsApp not configured (no session_path or phone_number_id in config)"
+                    });
+                    return (StatusCode::NOT_FOUND, Json(err));
+                };
+
+                let msg = SendMessage::new(&send_body.message, &send_body.to);
+                tracing::info!(
+                    "/api/send: sending WhatsApp Web message to {}",
+                    send_body.to
+                );
+                match wa_web.send(&msg).await {
+                    Ok(()) => {
+                        let body = serde_json::json!({"status": "sent", "channel": "whatsapp-web"});
+                        (StatusCode::OK, Json(body))
+                    }
+                    Err(e) => {
+                        tracing::error!("/api/send WhatsApp Web error: {e:#}");
+                        let err =
+                            serde_json::json!({"error": format!("WhatsApp Web send failed: {e}")});
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+                    }
+                }
+            }
+            #[cfg(not(feature = "whatsapp-web"))]
+            {
+                // Cloud API only
+                if let Some(ref wa_cloud) = state.whatsapp {
+                    match wa_cloud
+                        .send(&SendMessage::new(&send_body.message, &send_body.to))
+                        .await
+                    {
+                        Ok(()) => {
+                            let body =
+                                serde_json::json!({"status": "sent", "channel": "whatsapp-cloud"});
+                            (StatusCode::OK, Json(body))
+                        }
+                        Err(e) => {
+                            let err =
+                                serde_json::json!({"error": format!("WhatsApp send failed: {e}")});
+                            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+                        }
+                    }
+                } else {
+                    let err = serde_json::json!({"error": "WhatsApp not configured"});
+                    (StatusCode::NOT_FOUND, Json(err))
+                }
+            }
+        }
+        other => {
+            let err = serde_json::json!({"error": format!("Unsupported channel: {other}. Supported: whatsapp")});
+            (StatusCode::BAD_REQUEST, Json(err))
+        }
+    }
+}
+
 /// `WhatsApp` verification query params
 #[derive(serde::Deserialize)]
 pub struct WhatsAppVerifyQuery {
@@ -1157,6 +1388,18 @@ async fn handle_whatsapp_message(
                 .mem
                 .store(&key, &msg.content, MemoryCategory::Conversation, None)
                 .await;
+        }
+
+        // ── Deterministic trigger: Spotify podcast on-demand ──
+        // Bypass LLM tool-calling (unreliable for fire-and-forget commands)
+        // and spawn the summarizer script directly.
+        if let Some(spotify_url) = extract_spotify_podcast_url(&msg.content) {
+            spawn_podcast_summarizer(&spotify_url, "whatsapp", &msg.reply_target);
+            let ack = "收到！正在處理緊呢條新連結，等陣就有結果～ 🎧";
+            if let Err(e) = wa.send(&SendMessage::new(ack, &msg.reply_target)).await {
+                tracing::error!("Failed to send WhatsApp podcast ack: {e}");
+            }
+            continue;
         }
 
         match run_gateway_chat_with_tools(&state, &msg.content).await {
@@ -1476,6 +1719,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            whatsapp_web: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1524,6 +1768,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            whatsapp_web: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1889,6 +2134,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            whatsapp_web: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1952,6 +2198,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            whatsapp_web: None,
         };
 
         let headers = HeaderMap::new();
@@ -2027,6 +2274,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            whatsapp_web: None,
         };
 
         let response = handle_webhook(
@@ -2074,6 +2322,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            whatsapp_web: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2126,6 +2375,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            whatsapp_web: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2183,6 +2433,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            whatsapp_web: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2236,6 +2487,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            whatsapp_web: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2641,5 +2893,50 @@ mod tests {
 
         // Should be allowed again
         assert!(limiter.allow("burst-ip"));
+    }
+
+    #[test]
+    fn extract_spotify_podcast_url_with_pc_prefix() {
+        let url = extract_spotify_podcast_url(
+            "Pc:https://open.spotify.com/episode/6JQM0nXEIgAdMYIPL9odAS?si=fa69aceQQCOLdXsQfq1kTQ",
+        );
+        assert_eq!(
+            url.as_deref(),
+            Some("https://open.spotify.com/episode/6JQM0nXEIgAdMYIPL9odAS")
+        );
+    }
+
+    #[test]
+    fn extract_spotify_podcast_url_with_fullwidth_colon() {
+        let url = extract_spotify_podcast_url("pc\u{ff1a}https://open.spotify.com/episode/abc123");
+        assert_eq!(
+            url.as_deref(),
+            Some("https://open.spotify.com/episode/abc123")
+        );
+    }
+
+    #[test]
+    fn extract_spotify_podcast_url_with_space_after_colon() {
+        let url = extract_spotify_podcast_url("Pc: https://open.spotify.com/episode/abc123?si=xyz");
+        assert_eq!(
+            url.as_deref(),
+            Some("https://open.spotify.com/episode/abc123")
+        );
+    }
+
+    #[test]
+    fn extract_spotify_podcast_url_bare_url() {
+        // Without "Pc:" prefix — should still extract from raw Spotify URL
+        let url = extract_spotify_podcast_url("https://open.spotify.com/episode/abc123");
+        assert_eq!(
+            url.as_deref(),
+            Some("https://open.spotify.com/episode/abc123")
+        );
+    }
+
+    #[test]
+    fn extract_spotify_podcast_url_non_spotify() {
+        assert!(extract_spotify_podcast_url("Pc: https://example.com").is_none());
+        assert!(extract_spotify_podcast_url("hello world").is_none());
     }
 }

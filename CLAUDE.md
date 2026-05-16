@@ -1,30 +1,82 @@
-# CLAUDE.md — ZeroClaw Agent Engineering Protocol
+# CLAUDE.md
 
-This file defines the default working protocol for Claude agents in this repository.
-Scope: entire repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## 1) Project Snapshot (Read First)
 
-ZeroClaw is a Rust-first autonomous agent runtime optimized for:
+ZeroClaw — a Rust-first autonomous agent runtime optimized for low overhead, security-first design, and high extensibility.
 
-- high performance
-- high efficiency
-- high stability
-- high extensibility
-- high sustainability
-- high security
+- **MSRV:** Rust 1.87
+- **Workspace:** `.` (zeroclaw main crate) + `crates/robot-kit`
+- **Edition:** 2021
 
 Core architecture is trait-driven and modular. Most extension work should be done by implementing traits and registering in factory modules.
 
-Key extension points:
+## 1.1) Build & Development Commands
 
-- `src/providers/traits.rs` (`Provider`)
-- `src/channels/traits.rs` (`Channel`)
-- `src/tools/traits.rs` (`Tool`)
-- `src/memory/traits.rs` (`Memory`)
-- `src/observability/traits.rs` (`Observer`)
-- `src/runtime/traits.rs` (`RuntimeAdapter`)
-- `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
+```bash
+# Format check
+cargo fmt --all -- --check
+
+# Lint (warnings are errors)
+cargo clippy --all-targets -- -D warnings
+
+# Tests
+cargo test --locked
+
+# Run a single test by name
+cargo test <test_name>
+
+# Run integration tests
+cargo test --test agent_e2e
+
+# Full local CI suite (requires Docker)
+./dev/ci.sh all
+
+# Individual CI targets
+./dev/ci.sh lint
+./dev/ci.sh test
+./dev/ci.sh build
+./dev/ci.sh security
+```
+
+Native (non-Docker) quality gate scripts:
+```bash
+./scripts/ci/rust_quality_gate.sh           # Standard lint
+./scripts/ci/rust_quality_gate.sh --strict  # Full repo lint
+./scripts/ci/rust_strict_delta_gate.sh      # Changed lines only
+./scripts/ci/docs_quality_gate.sh           # Markdown lint
+./scripts/ci/docs_links_gate.sh             # Link integrity
+```
+
+Web dashboard (inside `web/`):
+```bash
+npm install && npm run build   # Assets are embedded into the binary via rust-embed
+```
+
+Release profiles: `release` optimizes for binary size (`opt-level = "z"`, LTO, single codegen unit, strip, panic = abort). `release-fast` trades size for build speed (8 codegen units).
+
+Key extension points (trait + factory pattern — implement trait, register in `mod.rs` factory):
+
+| Trait | File | Purpose |
+|---|---|---|
+| `Provider` | `src/providers/traits.rs` | LLM backends (Anthropic, OpenAI, Gemini, Bedrock, Ollama, …) |
+| `Channel` | `src/channels/traits.rs` | Messaging transports (Telegram, Discord, Slack, WhatsApp, Matrix, …) |
+| `Tool` | `src/tools/traits.rs` | Agent capabilities (shell, file I/O, browser, memory, HTTP, …) |
+| `Memory` | `src/memory/traits.rs` | Persistence backends (Markdown, SQLite, Postgres, vector/RAG) |
+| `Observer` | `src/observability/traits.rs` | Telemetry and metrics |
+| `RuntimeAdapter` | `src/runtime/traits.rs` | Execution isolation (native, Landlock, Bubblewrap) |
+| `Peripheral` | `src/peripherals/traits.rs` | Hardware boards (STM32, RPi GPIO, Arduino, ESP32) |
+
+Key modules:
+
+- `src/main.rs` — CLI entrypoint; Clap-based subcommands (`run`, `onboard`, `tool`, `channel`, `provider`, `memory`, `schedule`, `service`, `doctor`, `security`, `migrate`)
+- `src/lib.rs` — module re-exports + shared command enums (consumed by `main.rs` and integration tests)
+- `src/agent/loop_.rs` — Core orchestration loop: request dispatch, tool execution, multi-provider fallback, memory integration
+- `src/config/schema.rs` — Config loading, schema export, migration. Resolution order: explicit config/CLI > provider-specific env vars (`OPENAI_API_KEY`, etc.) > generic env vars (`ZEROCLAW_API_KEY`, `API_KEY`)
+- `src/security/` — Policy enforcement, AEAD secret store, pairing/auth
+- `src/gateway/` — Axum-based HTTP webhook server
+- `web/` — React 19 + Vite + TypeScript dashboard (embedded into binary via `rust-embed`)
 
 ## 2) Deep Architecture Observations (Why This Protocol Exists)
 
@@ -46,89 +98,18 @@ These codebase realities should drive every design decision:
     - CI + docs governance + label routing are part of the product delivery system.
     - PR throughput is a design constraint; not just a maintainer inconvenience.
 
-## 3) Engineering Principles (Normative)
+## 3) Engineering Principles (Project-Specific Constraints)
 
-These principles are mandatory by default. They are not slogans; they are implementation constraints.
+Mandatory defaults. Generic definitions omitted; only project-specific rationale below.
 
-### 3.1 KISS (Keep It Simple, Stupid)
-
-**Why here:** Runtime + security behavior must stay auditable under pressure.
-
-Required:
-
-- Prefer straightforward control flow over clever meta-programming.
-- Prefer explicit match branches and typed structs over hidden dynamic behavior.
-- Keep error paths obvious and localized.
-
-### 3.2 YAGNI (You Aren't Gonna Need It)
-
-**Why here:** Premature features increase attack surface and maintenance burden.
-
-Required:
-
-- Do not add new config keys, trait methods, feature flags, or workflow branches without a concrete accepted use case.
-- Do not introduce speculative “future-proof” abstractions without at least one current caller.
-- Keep unsupported paths explicit (error out) rather than adding partial fake support.
-
-### 3.3 DRY + Rule of Three
-
-**Why here:** Naive DRY can create brittle shared abstractions across providers/channels/tools.
-
-Required:
-
-- Duplicate small, local logic when it preserves clarity.
-- Extract shared utilities only after repeated, stable patterns (rule-of-three).
-- When extracting, preserve module boundaries and avoid hidden coupling.
-
-### 3.4 SRP + ISP (Single Responsibility + Interface Segregation)
-
-**Why here:** Trait-driven architecture already encodes subsystem boundaries.
-
-Required:
-
-- Keep each module focused on one concern.
-- Extend behavior by implementing existing narrow traits whenever possible.
-- Avoid fat interfaces and “god modules” that mix policy + transport + storage.
-
-### 3.5 Fail Fast + Explicit Errors
-
-**Why here:** Silent fallback in agent runtimes can create unsafe or costly behavior.
-
-Required:
-
-- Prefer explicit `bail!`/errors for unsupported or unsafe states.
-- Never silently broaden permissions/capabilities.
-- Document fallback behavior when fallback is intentional and safe.
-
-### 3.6 Secure by Default + Least Privilege
-
-**Why here:** Gateway/tools/runtime can execute actions with real-world side effects.
-
-Required:
-
-- Deny-by-default for access and exposure boundaries.
-- Never log secrets, raw tokens, or sensitive payloads.
-- Keep network/filesystem/shell scope as narrow as possible unless explicitly justified.
-
-### 3.7 Determinism + Reproducibility
-
-**Why here:** Reliable CI and low-latency triage depend on deterministic behavior.
-
-Required:
-
-- Prefer reproducible commands and locked dependency behavior in CI-sensitive paths.
-- Keep tests deterministic (no flaky timing/network dependence without guardrails).
-- Ensure local validation commands map to CI expectations.
-
-### 3.8 Reversibility + Rollback-First Thinking
-
-**Why here:** Fast recovery is mandatory under high PR volume.
-
-Required:
-
-- Keep changes easy to revert (small scope, clear blast radius).
-- For risky changes, define rollback path before merge.
-- Avoid mixed mega-patches that block safe rollback.
+- **KISS** — runtime/security must stay auditable under pressure. No clever metaprogramming on hot paths. Prefer explicit `match` + typed structs.
+- **YAGNI** — new config keys, trait methods, feature flags, or workflow branches require a current accepted use case. No speculative `future_*` fields. Unsupported paths must `bail!`, not partially fake support.
+- **DRY + Rule-of-Three** — duplicate small local logic when it preserves clarity. Extract only after 3 stable repetitions. Never share across providers/channels/tools without explicit contract.
+- **SRP/ISP** — orchestration in `agent/`, transport in `channels/`, model I/O in `providers/`, policy in `security/`, execution in `tools/`. No mixing. Extend via existing narrow traits.
+- **Fail-Fast** — `bail!` on unsupported/unsafe states. Never silently broaden capabilities. Document any intentional fallback inline.
+- **Secure-by-default + Least Privilege** — deny-by-default at exposure boundaries. Never log secrets/tokens/raw payloads. Narrow net/fs/shell scope unless explicitly justified.
+- **Determinism** — CI-sensitive paths use locked deps. Tests deterministic (no flaky timing/network without guardrails). Local validation must mirror CI.
+- **Reversibility** — small scope, clear blast radius. High-risk changes define rollback path before merge. No mixed feature+refactor+infra patches.
 
 ## 4) Repository Map (High-Level)
 
@@ -316,7 +297,7 @@ Default local checks for code changes:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --locked
 ```
 
 Preferred local pre-PR validation path (recommended, not required):
@@ -375,28 +356,25 @@ When a PR supersedes another contributor's PR and carries forward substantive co
 - In the PR body, list superseded PR links and briefly state what was incorporated from each.
 - If no actual code/design was incorporated (only inspiration), do not use `Co-authored-by`; give credit in PR notes instead.
 
-### 9.3 Superseded-PR PR Template (Recommended)
+### 9.3 Superseded-PR Templates (Recommended)
 
-When superseding multiple PRs, use a consistent title/body structure to reduce reviewer ambiguity.
+Use consistent title/body/commit structure when superseding prior PRs.
 
-- Recommended title format: `feat(<scope>): unify and supersede #<pr_a>, #<pr_b> [and #<pr_n>]`
-- If this is docs/chore/meta only, keep the same supersede suffix and use the appropriate conventional-commit type.
-- In the PR body, include the following template (fill placeholders, remove non-applicable lines):
+**Title:** `feat(<scope>): unify and supersede #<pr_a>, #<pr_b> [and #<pr_n>]` (use appropriate conventional-commit type for docs/chore/meta).
+
+**PR body:**
 
 ```md
 ## Supersedes
 - #<pr_a> by @<author_a>
 - #<pr_b> by @<author_b>
-- #<pr_n> by @<author_n>
 
 ## Integrated Scope
 - From #<pr_a>: <what was materially incorporated>
 - From #<pr_b>: <what was materially incorporated>
-- From #<pr_n>: <what was materially incorporated>
 
 ## Attribution
-- Co-authored-by trailers added for materially incorporated contributors: Yes/No
-- If No, explain why (for example: no direct code/design carry-over)
+- Co-authored-by trailers added: Yes/No (if No, explain — e.g. no direct code carry-over)
 
 ## Non-goals
 - <explicitly list what was not carried over>
@@ -406,32 +384,26 @@ When superseding multiple PRs, use a consistent title/body structure to reduce r
 - Rollback: <revert commit/PR strategy>
 ```
 
-### 9.4 Superseded-PR Commit Template (Recommended)
-
-When a commit unifies or supersedes prior PR work, use a deterministic commit message layout so attribution is machine-parsed and reviewer-friendly.
-
-- Keep one blank line between message sections, and exactly one blank line before trailer lines.
-- Keep each trailer on its own line; do not wrap, indent, or encode as escaped `\n` text.
-- Add one `Co-authored-by` trailer per materially incorporated contributor, using GitHub-recognized email.
-- If no direct code/design is carried over, omit `Co-authored-by` and explain attribution in the PR body instead.
+**Commit message** — one blank line between sections; exactly one blank line before trailers; one trailer per line, never escaped `\n`:
 
 ```text
-feat(<scope>): unify and supersede #<pr_a>, #<pr_b> [and #<pr_n>]
+feat(<scope>): unify and supersede #<pr_a>, #<pr_b>
 
 <one-paragraph summary of integrated outcome>
 
 Supersedes:
 - #<pr_a> by @<author_a>
 - #<pr_b> by @<author_b>
-- #<pr_n> by @<author_n>
 
 Integrated scope:
-- <subsystem_or_feature_a>: from #<pr_x>
-- <subsystem_or_feature_b>: from #<pr_y>
+- <subsystem_a>: from #<pr_x>
+- <subsystem_b>: from #<pr_y>
 
 Co-authored-by: <Name A> <login_a@users.noreply.github.com>
 Co-authored-by: <Name B> <login_b@users.noreply.github.com>
 ```
+
+Use GitHub-recognized email (`<login@users.noreply.github.com>` or verified commit email). Omit `Co-authored-by` if no direct code/design carry-over; credit in PR notes instead.
 
 Reference docs:
 

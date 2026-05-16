@@ -455,6 +455,88 @@ Examples:
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+
+    /// Run the daily investment report pipeline
+    #[command(long_about = "\
+Manage the daily investment report pipeline.
+
+Fetch content from configured RSS/podcast feeds and YouTube channels, \
+transcribe audio, analyze each piece with an LLM, aggregate results, \
+and generate a daily investment report delivered via WhatsApp.
+
+Subcommands:
+  run       Execute the report pipeline now
+  schedule  Register a daily cron job
+  list      Show recent reports
+  show      Display a specific report's JSON
+
+Requires environment variables: OPENROUTER_API_KEY, and optionally \
+YOUTUBE_API_KEY, APIFY_TOKEN, ASSEMBLYAI_API_KEY.
+
+Examples:
+  zeroclaw invest-report run --recipient +886912345678
+  zeroclaw invest-report run --recipient +886912345678 --dry-run
+  zeroclaw invest-report schedule --recipient +886912345678
+  zeroclaw invest-report list
+  zeroclaw invest-report show <id>")]
+    InvestReport {
+        #[command(subcommand)]
+        invest_command: InvestReportCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InvestReportCommands {
+    /// Execute the report pipeline now
+    Run {
+        /// WhatsApp recipient phone number (E.164 format, e.g. +886912345678)
+        #[arg(long)]
+        recipient: String,
+
+        /// LLM model to use (default: google/gemini-2.5-flash)
+        #[arg(long, default_value = "google/gemini-2.5-flash")]
+        model: String,
+
+        /// Temperature for LLM generation (0.0 - 2.0)
+        #[arg(long, default_value = "0.3")]
+        temperature: f64,
+
+        /// Skip WhatsApp delivery and print report to stdout
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Register a daily cron job to run the report pipeline
+    Schedule {
+        /// WhatsApp recipient phone number (E.164 format)
+        #[arg(long)]
+        recipient: String,
+
+        /// Cron expression (default: "0 9 * * *" = 09:00 daily)
+        #[arg(long, default_value = "0 9 * * *")]
+        cron: String,
+
+        /// IANA timezone (default: Asia/Taipei)
+        #[arg(long, default_value = "Asia/Taipei")]
+        tz: String,
+
+        /// LLM model to use
+        #[arg(long, default_value = "google/gemini-2.5-flash")]
+        model: String,
+    },
+
+    /// List recent investment reports
+    List {
+        /// Maximum number of reports to show
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Show a specific report's full JSON
+    Show {
+        /// Report ID
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1000,6 +1082,115 @@ async fn main() -> Result<()> {
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
                 );
                 Ok(())
+            }
+        },
+
+        Commands::InvestReport { invest_command } => match invest_command {
+            InvestReportCommands::Run {
+                recipient,
+                model,
+                temperature,
+                dry_run,
+            } => {
+                let reporter_config = config.invest_reporter.as_ref().cloned().unwrap_or_default();
+
+                let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+                let provider = providers::create_resilient_provider_with_options(
+                    provider_name,
+                    config.api_key.as_deref(),
+                    config.api_url.as_deref(),
+                    &config.reliability,
+                    &providers::ProviderRuntimeOptions::default(),
+                )?;
+
+                let report = integrations::investment_reporter::run_daily_report(
+                    &config,
+                    &reporter_config,
+                    provider.as_ref(),
+                    &model,
+                    temperature,
+                    &recipient,
+                    dry_run,
+                )
+                .await?;
+
+                info!(
+                    "Report generated: {} symbols analysed, date {}",
+                    report.report.symbols.len(),
+                    report.report_date,
+                );
+                if dry_run {
+                    println!("\n{}", report.whatsapp_summary);
+                }
+                Ok(())
+            }
+
+            InvestReportCommands::Schedule {
+                recipient,
+                cron: cron_expr,
+                tz,
+                model,
+            } => {
+                let command =
+                    format!("zeroclaw invest-report run --recipient {recipient} --model {model}");
+                let job = cron::add_shell_job(
+                    &config,
+                    Some("invest-report-daily".to_string()),
+                    cron::Schedule::Cron {
+                        expr: cron_expr.clone(),
+                        tz: Some(tz.clone()),
+                    },
+                    &command,
+                )?;
+                println!("✅ Scheduled daily investment report");
+                println!("   Job ID:     {}", job.id);
+                println!("   Schedule:   {cron_expr} ({tz})");
+                println!("   Recipient:  {recipient}");
+                println!("   Model:      {model}");
+                println!(
+                    "   Next run:   {}",
+                    job.next_run.format("%Y-%m-%d %H:%M %Z")
+                );
+                Ok(())
+            }
+
+            InvestReportCommands::List { limit } => {
+                let conn =
+                    integrations::investment_reporter::recorder::open_db(&config.workspace_dir)?;
+                let reports =
+                    integrations::investment_reporter::recorder::list_reports(&conn, limit)?;
+
+                if reports.is_empty() {
+                    println!("No investment reports found.");
+                    return Ok(());
+                }
+
+                println!(
+                    "{:<38} {:<12} {:>7} {:>7} {:<10}",
+                    "ID", "Date", "Sources", "Symbols", "Status"
+                );
+                println!("{}", "─".repeat(78));
+                for r in &reports {
+                    println!(
+                        "{:<38} {:<12} {:>7} {:>7} {:<10}",
+                        r.id, r.report_date, r.sources_count, r.symbols_count, r.delivery_status,
+                    );
+                }
+                Ok(())
+            }
+
+            InvestReportCommands::Show { id } => {
+                let conn =
+                    integrations::investment_reporter::recorder::open_db(&config.workspace_dir)?;
+                match integrations::investment_reporter::recorder::get_report_json(&conn, &id)? {
+                    Some(json) => {
+                        println!("{json}");
+                        Ok(())
+                    }
+                    None => {
+                        anyhow::bail!("Report not found: {id}");
+                    }
+                }
             }
         },
     }

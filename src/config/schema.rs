@@ -206,6 +206,10 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// Investment reporter pipeline configuration (`[invest_reporter]`).
+    #[serde(default)]
+    pub invest_reporter: Option<crate::integrations::feed_processor::types::InvestReporterConfig>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -3419,6 +3423,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            invest_reporter: None,
         }
     }
 }
@@ -4689,6 +4694,7 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            invest_reporter: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4863,6 +4869,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            invest_reporter: None,
         };
 
         config.save().await.unwrap();
