@@ -1057,6 +1057,9 @@ pub fn skills_to_prompt_with_mode(
                     write_xml_text_element(&mut prompt, 8, "name", &tool.name);
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
                     write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
+                    if tool.kind == "shell" && !tool.command.is_empty() {
+                        write_xml_text_element(&mut prompt, 8, "command", &tool.command);
+                    }
                     let _ = writeln!(prompt, "      </tool>");
                 }
                 let _ = writeln!(prompt, "    </tools>");
