@@ -2657,16 +2657,44 @@ fn spawn_supervised_listener_with_health_interval(
             zeroclaw_runtime::health::mark_component_ok(&component);
             let mut health = tokio::time::interval(health_interval);
             health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let result = {
-                let listen_future = ch.listen(tx.clone());
-                tokio::pin!(listen_future);
+            health.tick().await;
+            let listener = {
+                let ch = Arc::clone(&ch);
+                let tx = tx.clone();
+                tokio::spawn(async move { ch.listen(tx).await })
+            };
+            tokio::pin!(listener);
 
-                loop {
-                    tokio::select! {
-                        _ = health.tick() => {
+            let result = loop {
+                tokio::select! {
+                    _ = health.tick() => {
+                        if ch.health_check().await {
                             zeroclaw_runtime::health::mark_component_ok(&component);
+                        } else {
+                            let message = format!(
+                                "{} health check failed while listener was running",
+                                ch.name()
+                            );
+                            tracing::warn!("{}", message);
+                            zeroclaw_runtime::health::mark_component_error(&component, &message);
+                            listener.as_mut().abort();
+                            let _ = listener.await;
+                            break Err(anyhow::anyhow!(message));
                         }
-                        result = &mut listen_future => break result,
+                    }
+                    join_result = &mut listener => {
+                        break match join_result {
+                            Ok(result) => result,
+                            Err(err) if err.is_cancelled() => Err(anyhow::anyhow!(
+                                "{} listener task cancelled",
+                                ch.name()
+                            )),
+                            Err(err) => Err(anyhow::anyhow!(
+                                "{} listener task join error: {}",
+                                ch.name(),
+                                err
+                            )),
+                        };
                     }
                 }
             };
@@ -12307,6 +12335,12 @@ This is an example JSON object for profile settings."#;
         calls: Arc<AtomicUsize>,
     }
 
+    struct UnhealthyWhileRunningChannel {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        healthy: Arc<AtomicBool>,
+    }
+
     #[async_trait::async_trait]
     impl Channel for AlwaysFailChannel {
         fn name(&self) -> &str {
@@ -12343,6 +12377,30 @@ This is an example JSON object for profile settings."#;
             self.calls.fetch_add(1, Ordering::SeqCst);
             tx.closed().await;
             Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for UnhealthyWhileRunningChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tx.closed().await;
+            Ok(())
+        }
+
+        async fn health_check(&self) -> bool {
+            self.healthy.load(Ordering::SeqCst)
         }
     }
 
@@ -12418,6 +12476,50 @@ This is an example JSON object for profile settings."#;
         let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
         assert!(join.is_ok(), "listener should stop after channel shutdown");
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_restarts_when_health_check_fails() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let healthy = Arc::new(AtomicBool::new(true));
+        let channel_name = format!("test-supervised-unhealthy-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let channel: Arc<dyn Channel> = Arc::new(UnhealthyWhileRunningChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            healthy: Arc::clone(&healthy),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+        );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        healthy.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_eq!(component["status"], "error");
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("health check failed")
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "listener should restart after health failure"
+        );
+
+        drop(rx);
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[test]
