@@ -88,25 +88,6 @@ impl HttpRequestTool {
         result
     }
 
-    fn redact_headers_for_display(headers: &[(String, String)]) -> Vec<(String, String)> {
-        headers
-            .iter()
-            .map(|(key, value)| {
-                let lower = key.to_lowercase();
-                let is_sensitive = lower.contains("authorization")
-                    || lower.contains("api-key")
-                    || lower.contains("apikey")
-                    || lower.contains("token")
-                    || lower.contains("secret");
-                if is_sensitive {
-                    (key.clone(), "***REDACTED***".into())
-                } else {
-                    (key.clone(), value.clone())
-                }
-            })
-            .collect()
-    }
-
     async fn execute_request(
         &self,
         url: &str,
@@ -253,12 +234,12 @@ impl Tool for HttpRequestTool {
                 // Get response headers (redact sensitive ones)
                 let response_headers = response.headers().iter();
                 let headers_text = response_headers
-                    .map(|(k, _)| {
+                    .map(|(k, v)| {
                         let is_sensitive = k.as_str().to_lowercase().contains("set-cookie");
                         if is_sensitive {
                             format!("{}: ***REDACTED***", k.as_str())
                         } else {
-                            format!("{}: {:?}", k.as_str(), k.as_str())
+                            format!("{}: {}", k.as_str(), v.to_str().unwrap_or("<non-UTF-8>"))
                         }
                     })
                     .collect::<Vec<_>>()
@@ -746,37 +727,6 @@ mod tests {
         assert!(parsed
             .iter()
             .any(|(k, v)| k == "Content-Type" && v == "application/json"));
-    }
-
-    #[test]
-    fn redact_headers_for_display_redacts_sensitive() {
-        let headers = vec![
-            ("Authorization".into(), "Bearer secret".into()),
-            ("Content-Type".into(), "application/json".into()),
-            ("X-API-Key".into(), "my-key".into()),
-            ("X-Secret-Token".into(), "tok-123".into()),
-        ];
-        let redacted = HttpRequestTool::redact_headers_for_display(&headers);
-        assert_eq!(redacted.len(), 4);
-        assert!(redacted
-            .iter()
-            .any(|(k, v)| k == "Authorization" && v == "***REDACTED***"));
-        assert!(redacted
-            .iter()
-            .any(|(k, v)| k == "X-API-Key" && v == "***REDACTED***"));
-        assert!(redacted
-            .iter()
-            .any(|(k, v)| k == "X-Secret-Token" && v == "***REDACTED***"));
-        assert!(redacted
-            .iter()
-            .any(|(k, v)| k == "Content-Type" && v == "application/json"));
-    }
-
-    #[test]
-    fn redact_headers_does_not_alter_original() {
-        let headers = vec![("Authorization".into(), "Bearer real-token".into())];
-        let _ = HttpRequestTool::redact_headers_for_display(&headers);
-        assert_eq!(headers[0].1, "Bearer real-token");
     }
 
     // ── SSRF: alternate IP notation bypass defense-in-depth ─────────
