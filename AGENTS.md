@@ -1,7 +1,12 @@
 # AGENTS.md — ZeroClaw Agent Engineering Protocol
 
 This file defines the default working protocol for coding agents in this repository.
-Scope: entire repository.
+Scope: entire repository. `CLAUDE.md` carries the identical protocol for Claude
+agents — keep the two files in sync when editing either.
+
+For PR-process detail (templates, superseded-PR attribution layout, handoff format),
+see `CONTRIBUTING.md` and `docs/pr-workflow.md`. This file stays focused on the
+load-bearing engineering protocol.
 
 ## 1) Project Snapshot (Read First)
 
@@ -30,41 +35,27 @@ Key extension points:
 
 These codebase realities should drive every design decision:
 
-1. **Trait + factory architecture is the stability backbone**
-    - Extension points are intentionally explicit and swappable.
-    - Most features should be added via trait implementation + factory registration, not cross-cutting rewrites.
-2. **Security-critical surfaces are first-class and internet-adjacent**
-    - `src/gateway/`, `src/security/`, `src/tools/`, `src/runtime/` carry high blast radius.
-    - Defaults already lean secure-by-default (pairing, bind safety, limits, secret handling); keep it that way.
-3. **Performance and binary size are product goals, not nice-to-have**
-    - `Cargo.toml` release profile and dependency choices optimize for size and determinism.
-    - Convenience dependencies and broad abstractions can silently regress these goals.
-4. **Config and runtime contracts are user-facing API**
-    - `src/config/schema.rs` and CLI commands are effectively public interfaces.
-    - Backward compatibility and explicit migration matter.
-5. **The project now runs in high-concurrency collaboration mode**
-    - CI + docs governance + label routing are part of the product delivery system.
-    - PR throughput is a design constraint; not just a maintainer inconvenience.
+1. **Trait + factory architecture is the stability backbone** — extension points are explicit and swappable. Add features via trait implementation + factory registration, not cross-cutting rewrites.
+2. **Security-critical surfaces are first-class and internet-adjacent** — `src/gateway/`, `src/security/`, `src/tools/`, `src/runtime/` carry high blast radius. Defaults are secure-by-default (pairing, bind safety, limits, secret handling); keep it that way.
+3. **Performance and binary size are product goals** — the `Cargo.toml` release profile and dependency choices optimize for size and determinism. Convenience dependencies and broad abstractions can silently regress these goals.
+4. **Config and runtime contracts are user-facing API** — `src/config/schema.rs` and CLI commands are effectively public interfaces. Backward compatibility and explicit migration matter.
+5. **The project runs in high-concurrency collaboration mode** — CI, docs governance, and label routing are part of the delivery system. PR throughput is a design constraint.
 
 ## 3) Engineering Principles (Normative)
 
-These principles are mandatory by default. They are not slogans; they are implementation constraints.
+These principles are mandatory by default. They are implementation constraints, not slogans.
 
-### 3.1 KISS (Keep It Simple, Stupid)
+### 3.1 KISS
 
 **Why here:** Runtime + security behavior must stay auditable under pressure.
-
-Required:
 
 - Prefer straightforward control flow over clever meta-programming.
 - Prefer explicit match branches and typed structs over hidden dynamic behavior.
 - Keep error paths obvious and localized.
 
-### 3.2 YAGNI (You Aren't Gonna Need It)
+### 3.2 YAGNI
 
 **Why here:** Premature features increase attack surface and maintenance burden.
-
-Required:
 
 - Do not add new config keys, trait methods, feature flags, or workflow branches without a concrete accepted use case.
 - Do not introduce speculative “future-proof” abstractions without at least one current caller.
@@ -74,17 +65,13 @@ Required:
 
 **Why here:** Naive DRY can create brittle shared abstractions across providers/channels/tools.
 
-Required:
-
 - Duplicate small, local logic when it preserves clarity.
 - Extract shared utilities only after repeated, stable patterns (rule-of-three).
 - When extracting, preserve module boundaries and avoid hidden coupling.
 
-### 3.4 SRP + ISP (Single Responsibility + Interface Segregation)
+### 3.4 SRP + ISP
 
 **Why here:** Trait-driven architecture already encodes subsystem boundaries.
-
-Required:
 
 - Keep each module focused on one concern.
 - Extend behavior by implementing existing narrow traits whenever possible.
@@ -94,8 +81,6 @@ Required:
 
 **Why here:** Silent fallback in agent runtimes can create unsafe or costly behavior.
 
-Required:
-
 - Prefer explicit `bail!`/errors for unsupported or unsafe states.
 - Never silently broaden permissions/capabilities.
 - Document fallback behavior when fallback is intentional and safe.
@@ -103,8 +88,6 @@ Required:
 ### 3.6 Secure by Default + Least Privilege
 
 **Why here:** Gateway/tools/runtime can execute actions with real-world side effects.
-
-Required:
 
 - Deny-by-default for access and exposure boundaries.
 - Never log secrets, raw tokens, or sensitive payloads.
@@ -114,8 +97,6 @@ Required:
 
 **Why here:** Reliable CI and low-latency triage depend on deterministic behavior.
 
-Required:
-
 - Prefer reproducible commands and locked dependency behavior in CI-sensitive paths.
 - Keep tests deterministic (no flaky timing/network dependence without guardrails).
 - Ensure local validation commands map to CI expectations.
@@ -123,8 +104,6 @@ Required:
 ### 3.8 Reversibility + Rollback-First Thinking
 
 **Why here:** Fast recovery is mandatory under high PR volume.
-
-Required:
 
 - Keep changes easy to revert (small scope, clear blast radius).
 - For risky changes, define rollback path before merge.
@@ -157,9 +136,7 @@ Canonical entry points:
 - docs hubs: `docs/README.md`, `docs/README.zh-CN.md`, `docs/README.ja.md`, `docs/README.ru.md`, `docs/README.fr.md`, `docs/i18n/vi/README.md`
 - unified TOC: `docs/SUMMARY.md`
 
-Supported locales (current contract):
-
-- `en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`
+Supported locales (current contract): `en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`
 
 Collection indexes (category navigation):
 
@@ -204,28 +181,18 @@ When uncertain, classify as higher risk.
 
 ## 6) Agent Workflow (Required)
 
-1. **Read before write**
-    - Inspect existing module, factory wiring, and adjacent tests before editing.
-2. **Define scope boundary**
-    - One concern per PR; avoid mixed feature+refactor+infra patches.
-3. **Implement minimal patch**
-    - Apply KISS/YAGNI/DRY rule-of-three explicitly.
-4. **Validate by risk tier**
-    - Docs-only: lightweight checks.
-    - Code/risky changes: full relevant checks and focused scenarios.
-5. **Document impact**
-    - Update docs/PR notes for behavior, risk, side effects, and rollback.
-    - If CLI/config/provider/channel behavior changed, update corresponding runtime-contract references.
-    - If docs entry points changed, keep all supported locale README/docs-hub navigation aligned (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`).
-6. **Respect queue hygiene**
-    - If stacked PR: declare `Depends on #...`.
-    - If replacing old PR: declare `Supersedes #...`.
+1. **Read before write** — inspect existing module, factory wiring, and adjacent tests before editing.
+2. **Define scope boundary** — one concern per PR; avoid mixed feature+refactor+infra patches.
+3. **Implement minimal patch** — apply KISS/YAGNI/DRY rule-of-three explicitly.
+4. **Validate by risk tier** — docs-only: lightweight checks; code/risky changes: full relevant checks and focused scenarios.
+5. **Document impact** — update docs/PR notes for behavior, risk, side effects, and rollback. If CLI/config/provider/channel behavior changed, update corresponding runtime-contract references. If docs entry points changed, keep all supported locale README/docs-hub navigation aligned.
+6. **Respect queue hygiene** — if stacked PR, declare `Depends on #...`; if replacing an old PR, declare `Supersedes #...`.
 
 ### 6.1 Branch / Commit / PR Flow (Required)
 
 All contributors (human or agent) must follow the same collaboration flow:
 
-- Create and work from a non-`main` branch.
+- Create and work from a non-`main`, non-`dev` branch.
 - Commit changes to that branch with clear, scoped commit messages.
 - Open a PR to `dev`; do not push directly to `dev` or `main`.
 - `main` is reserved for release promotion PRs from `dev`.
@@ -309,7 +276,6 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - When shared docs wording changes, sync corresponding localized docs for supported locales in the same PR (or explicitly document deferral and follow-up PR).
 - For docs snapshots, add new date-stamped files for new sprints rather than rewriting historical context.
 
-
 ## 8) Validation Matrix
 
 Default local checks for code changes:
@@ -346,9 +312,9 @@ If full checks are impractical, run the most relevant subset and document what w
 
 - Follow `.github/pull_request_template.md` fully (including side effects / blast radius).
 - Keep PR descriptions concrete: problem, change, non-goals, risk, rollback.
-- Use conventional commit titles.
-- Prefer small PRs (`size: XS/S/M`) when possible.
+- Use conventional commit titles. Prefer small PRs (`size: XS/S/M`) when possible.
 - Agent-assisted PRs are welcome, **but contributors remain accountable for understanding what their code will do**.
+- When a PR supersedes another contributor's PR and carries forward substantive code or design, preserve authorship: add one `Co-authored-by:` trailer per materially incorporated contributor and list superseded PR links in the body. Full commit/PR template detail lives in `CONTRIBUTING.md` and `docs/pr-workflow.md`.
 
 ### 9.1 Privacy/Sensitive Data and Neutral Wording (Required)
 
@@ -359,80 +325,8 @@ Treat privacy and neutrality as merge gates, not best-effort guidelines.
 - Use neutral project-scoped placeholders (for example: `user_a`, `test_user`, `project_bot`, `example.com`) instead of real identity data.
 - Test names/messages/fixtures must be impersonal and system-focused; avoid first-person or identity-specific language.
 - If identity-like context is unavoidable, use ZeroClaw-scoped roles/labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`) and avoid real-world personas.
-- Recommended identity-safe naming palette (use when identity-like context is required):
-    - actor labels: `ZeroClawAgent`, `ZeroClawOperator`, `ZeroClawMaintainer`, `zeroclaw_user`
-    - service/runtime labels: `zeroclaw_bot`, `zeroclaw_service`, `zeroclaw_runtime`, `zeroclaw_node`
-    - environment labels: `zeroclaw_project`, `zeroclaw_workspace`, `zeroclaw_channel`
 - If reproducing external incidents, redact and anonymize all payloads before committing.
 - Before push, review `git diff --cached` specifically for accidental sensitive strings and identity leakage.
-
-### 9.2 Superseded-PR Attribution (Required)
-
-When a PR supersedes another contributor's PR and carries forward substantive code or design decisions, preserve authorship explicitly.
-
-- In the integrating commit message, add one `Co-authored-by: Name <email>` trailer per superseded contributor whose work is materially incorporated.
-- Use a GitHub-recognized email (`<login@users.noreply.github.com>` or the contributor's verified commit email) so attribution is rendered correctly.
-- Keep trailers on their own lines after a blank line at commit-message end; never encode them as escaped `\\n` text.
-- In the PR body, list superseded PR links and briefly state what was incorporated from each.
-- If no actual code/design was incorporated (only inspiration), do not use `Co-authored-by`; give credit in PR notes instead.
-
-### 9.3 Superseded-PR PR Template (Recommended)
-
-When superseding multiple PRs, use a consistent title/body structure to reduce reviewer ambiguity.
-
-- Recommended title format: `feat(<scope>): unify and supersede #<pr_a>, #<pr_b> [and #<pr_n>]`
-- If this is docs/chore/meta only, keep the same supersede suffix and use the appropriate conventional-commit type.
-- In the PR body, include the following template (fill placeholders, remove non-applicable lines):
-
-```md
-## Supersedes
-- #<pr_a> by @<author_a>
-- #<pr_b> by @<author_b>
-- #<pr_n> by @<author_n>
-
-## Integrated Scope
-- From #<pr_a>: <what was materially incorporated>
-- From #<pr_b>: <what was materially incorporated>
-- From #<pr_n>: <what was materially incorporated>
-
-## Attribution
-- Co-authored-by trailers added for materially incorporated contributors: Yes/No
-- If No, explain why (for example: no direct code/design carry-over)
-
-## Non-goals
-- <explicitly list what was not carried over>
-
-## Risk and Rollback
-- Risk: <summary>
-- Rollback: <revert commit/PR strategy>
-```
-
-### 9.4 Superseded-PR Commit Template (Recommended)
-
-When a commit unifies or supersedes prior PR work, use a deterministic commit message layout so attribution is machine-parsed and reviewer-friendly.
-
-- Keep one blank line between message sections, and exactly one blank line before trailer lines.
-- Keep each trailer on its own line; do not wrap, indent, or encode as escaped `\n` text.
-- Add one `Co-authored-by` trailer per materially incorporated contributor, using GitHub-recognized email.
-- If no direct code/design is carried over, omit `Co-authored-by` and explain attribution in the PR body instead.
-
-```text
-feat(<scope>): unify and supersede #<pr_a>, #<pr_b> [and #<pr_n>]
-
-<one-paragraph summary of integrated outcome>
-
-Supersedes:
-- #<pr_a> by @<author_a>
-- #<pr_b> by @<author_b>
-- #<pr_n> by @<author_n>
-
-Integrated scope:
-- <subsystem_or_feature_a>: from #<pr_x>
-- <subsystem_or_feature_b>: from #<pr_y>
-
-Co-authored-by: <Name A> <login_a@users.noreply.github.com>
-Co-authored-by: <Name B> <login_b@users.noreply.github.com>
-```
 
 Reference docs:
 
@@ -463,17 +357,9 @@ Reference docs:
 - Do not hide behavior-changing side effects in refactor commits.
 - Do not include personal identity or sensitive information in test data, examples, docs, or commits.
 
-## 11) Handoff Template (Agent -> Agent / Maintainer)
+## 11) Handoff and Vibe Coding Guardrails
 
-When handing off work, include:
-
-1. What changed
-2. What did not change
-3. Validation run and results
-4. Remaining risks / unknowns
-5. Next recommended action
-
-## 12) Vibe Coding Guardrails
+When handing off work (agent -> agent / maintainer), state: what changed, what did not change, validation run and results, remaining risks/unknowns, next recommended action.
 
 When working in fast iterative mode:
 
@@ -482,3 +368,5 @@ When working in fast iterative mode:
 - Prefer deterministic behavior over clever shortcuts.
 - Do not “ship and hope” on security-sensitive paths.
 - If uncertain, leave a concrete TODO with verification context, not a hidden guess.
+</content>
+</invoke>
