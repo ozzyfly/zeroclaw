@@ -95,6 +95,29 @@ jobs:
             - name: Check binary size
               run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
 
+    msrv:
+        name: MSRV Check
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 20
+
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Read declared MSRV from Cargo.toml
+              id: msrv
+              shell: bash
+              run: |
+                  version=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  echo "version=${version}" >> "$GITHUB_OUTPUT"
+                  echo "Declared MSRV: ${version}"
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: ${{ steps.msrv.outputs.version }}
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - name: Check crate on declared MSRV
+              run: cargo check --locked --verbose
+
     docs-only:
         name: Docs-Only Fast Path
         needs: [changes]
@@ -236,7 +259,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
+        needs: [changes, lint, test, build, msrv, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Enforce required status
@@ -295,11 +318,13 @@ jobs:
                   lint_strict_delta_result="${{ needs.lint.result }}"
                   test_result="${{ needs.test.result }}"
                   build_result="${{ needs.build.result }}"
+                  msrv_result="${{ needs.msrv.result }}"
 
                   echo "lint=${lint_result}"
                   echo "lint_strict_delta=${lint_strict_delta_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
+                  echo "msrv=${msrv_result}"
                   echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
                   echo "license_file_owner_guard=${license_owner_result}"
@@ -319,11 +344,15 @@ jobs:
                       echo "Required PR build job did not pass."
                       exit 1
                     fi
+                    if [ "$msrv_result" != "success" ]; then
+                      echo "Required PR MSRV check did not pass."
+                      exit 1
+                    fi
                     echo "PR required checks passed."
                     exit 0
                   fi
 
-                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ] || [ "$msrv_result" != "success" ]; then
                     echo "Required push CI jobs did not pass."
                     exit 1
                   fi

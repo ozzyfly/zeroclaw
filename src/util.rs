@@ -43,6 +43,29 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Return the largest byte index `<= max` that lies on a UTF-8 character
+/// boundary of `s`.
+///
+/// Equivalent to the standard library's `str::floor_char_boundary`, which is
+/// only stable as of Rust 1.91. This in-crate version keeps the project
+/// buildable on its declared MSRV. Use it to truncate byte-length-limited
+/// output without splitting a multi-byte character.
+///
+/// If `max` is greater than or equal to the byte length of `s`, the byte
+/// length of `s` is returned.
+pub fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        s.len()
+    } else {
+        let mut idx = max;
+        // Byte 0 is always a char boundary, so this terminates without underflow.
+        while !s.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        idx
+    }
+}
+
 /// Utility enum for handling optional values.
 pub enum MaybeSet<T> {
     Set(T),
@@ -141,5 +164,46 @@ mod tests {
     fn test_truncate_zero_max_chars() {
         // Edge case: max_chars = 0
         assert_eq!(truncate_with_ellipsis("hello", 0), "...");
+    }
+
+    #[test]
+    fn floor_char_boundary_empty_string() {
+        assert_eq!(floor_char_boundary("", 0), 0);
+        assert_eq!(floor_char_boundary("", 5), 0);
+    }
+
+    #[test]
+    fn floor_char_boundary_ascii() {
+        let s = "hello";
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 3), 3);
+        assert_eq!(floor_char_boundary(s, 5), 5);
+    }
+
+    #[test]
+    fn floor_char_boundary_multibyte_mid_codepoint() {
+        // "🦀" is 4 bytes at indices 0..4; only 0 and 4 are boundaries.
+        let s = "🦀";
+        assert_eq!(floor_char_boundary(s, 1), 0);
+        assert_eq!(floor_char_boundary(s, 2), 0);
+        assert_eq!(floor_char_boundary(s, 3), 0);
+        assert_eq!(floor_char_boundary(s, 4), 4);
+        // Mixed: 'a' at byte 0, '🦀' at bytes 1..5.
+        let m = "a🦀";
+        assert_eq!(floor_char_boundary(m, 1), 1);
+        assert_eq!(floor_char_boundary(m, 3), 1);
+        assert_eq!(floor_char_boundary(m, 5), 5);
+    }
+
+    #[test]
+    fn floor_char_boundary_max_past_end() {
+        assert_eq!(floor_char_boundary("abc", 99), 3);
+        assert_eq!(floor_char_boundary("🦀", usize::MAX), 4);
+    }
+
+    #[test]
+    fn floor_char_boundary_zero() {
+        assert_eq!(floor_char_boundary("hello", 0), 0);
+        assert_eq!(floor_char_boundary("🦀", 0), 0);
     }
 }
