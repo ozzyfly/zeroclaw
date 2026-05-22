@@ -45,8 +45,10 @@ pub struct PairingGuard {
 impl PairingGuard {
     /// Create a new pairing guard.
     ///
-    /// If `require_pairing` is true and no tokens exist yet, a fresh
-    /// pairing code is generated and returned via `pairing_code()`.
+    /// A fresh pairing code is generated and returned via `pairing_code()`
+    /// whenever no tokens exist yet — independent of `require_pairing`. This
+    /// lets an operator obtain a bearer token even in no-pairing mode, which
+    /// the strict-auth routes (mutating `/api/*`) require.
     ///
     /// Existing tokens are accepted in both forms:
     /// - Plaintext (`zc_...`): hashed on load for backward compatibility
@@ -62,7 +64,7 @@ impl PairingGuard {
                 }
             })
             .collect();
-        let code = if require_pairing && tokens.is_empty() {
+        let code = if tokens.is_empty() {
             Some(generate_code())
         } else {
             None
@@ -168,6 +170,19 @@ impl PairingGuard {
     pub fn is_authenticated(&self, token: &str) -> bool {
         if !self.require_pairing {
             return true;
+        }
+        self.verify_token_strict(token)
+    }
+
+    /// Strictly verify a bearer token against the stored token hashes.
+    ///
+    /// Unlike [`is_authenticated`], this never short-circuits on
+    /// `require_pairing` — it always hashes the supplied token and checks it
+    /// against `paired_tokens`. An empty token, or any input while the token
+    /// set is empty, fails closed (returns `false`).
+    pub fn verify_token_strict(&self, token: &str) -> bool {
+        if token.is_empty() {
+            return false;
         }
         let hashed = hash_token(token);
         let tokens = self.paired_tokens.lock();
@@ -286,9 +301,58 @@ mod tests {
     }
 
     #[test]
-    async fn new_guard_no_code_when_pairing_disabled() {
+    async fn new_guard_generates_code_when_pairing_disabled_and_no_tokens() {
+        // C1: a pairing code MUST be obtainable in every pairing mode so an
+        // operator can acquire a bearer token for the strict-auth routes.
         let guard = PairingGuard::new(false, &[]);
-        assert!(guard.pairing_code().is_none());
+        assert!(
+            guard.pairing_code().is_some(),
+            "code must be generated when token set is empty, even with pairing disabled"
+        );
+        assert!(!guard.is_paired());
+    }
+
+    #[test]
+    async fn new_guard_no_code_when_pairing_disabled_and_tokens_exist() {
+        let guard = PairingGuard::new(false, &["zc_existing".into()]);
+        assert!(
+            guard.pairing_code().is_none(),
+            "no code should be minted once at least one token exists"
+        );
+        assert!(guard.is_paired());
+    }
+
+    #[test]
+    async fn verify_token_strict_accepts_valid_token_when_pairing_disabled() {
+        let guard = PairingGuard::new(false, &["zc_valid".into()]);
+        assert!(guard.verify_token_strict("zc_valid"));
+    }
+
+    #[test]
+    async fn verify_token_strict_rejects_invalid_token_when_pairing_disabled() {
+        let guard = PairingGuard::new(false, &["zc_valid".into()]);
+        assert!(!guard.verify_token_strict("zc_invalid"));
+    }
+
+    #[test]
+    async fn verify_token_strict_rejects_empty_token_when_pairing_disabled() {
+        let guard = PairingGuard::new(false, &["zc_valid".into()]);
+        assert!(!guard.verify_token_strict(""));
+    }
+
+    #[test]
+    async fn verify_token_strict_rejects_when_no_tokens() {
+        // Empty token set: strict path must fail closed regardless of input.
+        let guard = PairingGuard::new(false, &[]);
+        assert!(!guard.verify_token_strict("anything"));
+        assert!(!guard.verify_token_strict(""));
+    }
+
+    #[test]
+    async fn verify_token_strict_accepts_prehashed_token() {
+        let hashed = hash_token("zc_valid");
+        let guard = PairingGuard::new(false, &[hashed]);
+        assert!(guard.verify_token_strict("zc_valid"));
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! REST API handlers for the web dashboard.
 //!
-//! All `/api/*` routes require bearer token authentication (PairingGuard).
+//! Read-only `/api/*` routes use [`require_auth`]: a bearer token is required
+//! only when `gateway.require_pairing` is enabled. Mutating routes use
+//! [`require_auth_strict`], which always requires a valid bearer token
+//! regardless of the `require_pairing` setting.
 
 use super::AppState;
 use axum::{
@@ -20,7 +23,21 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|auth| auth.strip_prefix("Bearer "))
 }
 
-/// Verify bearer token against PairingGuard. Returns error response if unauthorized.
+/// Standard error response for an unauthorized `/api/*` request.
+fn unauthorized() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+        })),
+    )
+}
+
+/// Verify bearer token against PairingGuard for a read-only route.
+///
+/// When `gateway.require_pairing` is false this returns `Ok(())` without a
+/// token — read-only access stays convenient in local-trust mode. When pairing
+/// is enabled, a valid bearer token is required.
 fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
@@ -33,12 +50,25 @@ fn require_auth(
     if state.pairing.is_authenticated(token) {
         Ok(())
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-            })),
-        ))
+        Err(unauthorized())
+    }
+}
+
+/// Verify bearer token for a mutating route.
+///
+/// Unlike [`require_auth`], this never consults `require_pairing` — a valid
+/// bearer token is *always* required. When no token has been paired yet the
+/// request still fails closed with `401`; the error directs the caller to
+/// `POST /pair` first.
+fn require_auth_strict(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let token = extract_bearer_token(headers).unwrap_or("");
+    if state.pairing.verify_token_strict(token) {
+        Ok(())
+    } else {
+        Err(unauthorized())
     }
 }
 
@@ -139,7 +169,7 @@ pub async fn handle_api_config_put(
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
+    if let Err(e) = require_auth_strict(&state, &headers) {
         return e.into_response();
     }
 
@@ -236,7 +266,7 @@ pub async fn handle_api_cron_add(
     headers: HeaderMap,
     Json(body): Json<CronAddBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
+    if let Err(e) = require_auth_strict(&state, &headers) {
         return e.into_response();
     }
 
@@ -271,7 +301,7 @@ pub async fn handle_api_cron_delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
+    if let Err(e) = require_auth_strict(&state, &headers) {
         return e.into_response();
     }
 
@@ -319,7 +349,7 @@ pub async fn handle_api_doctor(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
+    if let Err(e) = require_auth_strict(&state, &headers) {
         return e.into_response();
     }
 
@@ -396,7 +426,7 @@ pub async fn handle_api_memory_store(
     headers: HeaderMap,
     Json(body): Json<MemoryStoreBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
+    if let Err(e) = require_auth_strict(&state, &headers) {
         return e.into_response();
     }
 
@@ -431,7 +461,7 @@ pub async fn handle_api_memory_delete(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
+    if let Err(e) = require_auth_strict(&state, &headers) {
         return e.into_response();
     }
 
@@ -509,19 +539,20 @@ pub async fn handle_api_health(
 
 // ── Helpers ─────────────────────────────────────────────────────
 
+/// Mask the value of every secret-bearing field in a serialized TOML config.
+///
+/// A line is masked only when the text before its first `=` trims to an
+/// *exact* key name in [`crate::config::SECRET_FIELD_NAMES`]. Exact-key
+/// matching (rather than a prefix denylist) means a key like `my_api_key`
+/// is left untouched, and — critically — every newly registered secret field
+/// is covered automatically once added to the registry.
 fn mask_sensitive_fields(toml_str: &str) -> String {
     let mut output = String::with_capacity(toml_str.len());
     for line in toml_str.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("api_key")
-            || trimmed.starts_with("bot_token")
-            || trimmed.starts_with("access_token")
-            || trimmed.starts_with("secret")
-            || trimmed.starts_with("app_secret")
-            || trimmed.starts_with("signing_secret")
-        {
-            if let Some(eq_pos) = line.find('=') {
-                output.push_str(&line[..eq_pos + 1]);
+        if let Some(eq_pos) = line.find('=') {
+            let key = line[..eq_pos].trim();
+            if crate::config::schema::is_secret_field(key) {
+                output.push_str(&line[..=eq_pos]);
                 output.push_str(" \"***MASKED***\"");
             } else {
                 output.push_str(line);
@@ -532,4 +563,141 @@ fn mask_sensitive_fields(toml_str: &str) -> String {
         output.push('\n');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// Sentinel value planted into every secret field; must never survive masking.
+    const SENTINEL: &str = "PLAINTEXT_SECRET_SENTINEL";
+
+    #[test]
+    fn mask_replaces_each_registered_key() {
+        // Exact-key match against the registry, with TOML-style indentation.
+        for key in crate::config::SECRET_FIELD_NAMES {
+            let toml = format!("  {key} = \"{SENTINEL}\"\n");
+            let masked = mask_sensitive_fields(&toml);
+            assert!(
+                !masked.contains(SENTINEL),
+                "registry key `{key}` was not masked: {masked}"
+            );
+            assert!(
+                masked.contains("***MASKED***"),
+                "registry key `{key}` did not receive the mask placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_leaves_non_secret_keys_untouched() {
+        let toml = "model = \"gpt-4o-mini\"\nport = 8080\n";
+        assert_eq!(mask_sensitive_fields(toml), toml);
+    }
+
+    #[test]
+    fn mask_does_not_match_substring_keys() {
+        // `my_api_key` / `api_key_extra` are not the exact key `api_key`.
+        let toml = "my_api_key = \"keep\"\napi_key_extra = \"keep\"\n";
+        let masked = mask_sensitive_fields(toml);
+        assert!(
+            masked.contains("\"keep\""),
+            "exact-key match must not fire on substring keys: {masked}"
+        );
+    }
+
+    #[test]
+    fn populated_config_serializes_with_no_unmasked_secret() {
+        // Build a Config with every reachable secret field set to the sentinel,
+        // serialize to TOML, mask it, and assert nothing leaked.
+        let mut config = Config::default();
+        config.api_key = Some(SENTINEL.into());
+        config.composio.api_key = Some(SENTINEL.into());
+        config.browser.computer_use.api_key = Some(SENTINEL.into());
+        config.web_search.brave_api_key = Some(SENTINEL.into());
+
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: SENTINEL.into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        config.channels_config.slack = Some(crate::config::SlackConfig {
+            bot_token: SENTINEL.into(),
+            app_token: Some(SENTINEL.into()),
+            channel_id: None,
+            allowed_users: vec![],
+        });
+        config.channels_config.matrix = Some(crate::config::MatrixConfig {
+            homeserver: "https://matrix.example.com".into(),
+            access_token: SENTINEL.into(),
+            user_id: None,
+            device_id: None,
+            room_id: "!room:example.com".into(),
+            allowed_users: vec![],
+        });
+        config.channels_config.whatsapp = Some(crate::config::WhatsAppConfig {
+            access_token: Some(SENTINEL.into()),
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: Some(SENTINEL.into()),
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+        });
+        config.channels_config.linq = Some(crate::config::LinqConfig {
+            api_token: SENTINEL.into(),
+            from_phone: "+15551234567".into(),
+            signing_secret: Some(SENTINEL.into()),
+            allowed_senders: vec![],
+        });
+        config.channels_config.nextcloud_talk = Some(crate::config::NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".into(),
+            app_token: SENTINEL.into(),
+            webhook_secret: None,
+            allowed_users: vec![],
+        });
+        config.channels_config.webhook = Some(crate::config::WebhookConfig {
+            port: 8080,
+            secret: Some(SENTINEL.into()),
+        });
+        config.channels_config.lark = Some(crate::config::LarkConfig {
+            app_id: "cli_app".into(),
+            app_secret: SENTINEL.into(),
+            encrypt_key: Some(SENTINEL.into()),
+            verification_token: Some(SENTINEL.into()),
+            allowed_users: vec![],
+            use_feishu: false,
+            receive_mode: crate::config::schema::LarkReceiveMode::default(),
+            port: None,
+        });
+        config.channels_config.irc = Some(crate::config::IrcConfig {
+            server: "irc.example.com".into(),
+            port: 6697,
+            nickname: "zeroclaw_bot".into(),
+            username: None,
+            channels: vec![],
+            allowed_users: vec![],
+            server_password: Some(SENTINEL.into()),
+            nickserv_password: Some(SENTINEL.into()),
+            sasl_password: Some(SENTINEL.into()),
+            verify_tls: None,
+        });
+
+        let toml = toml::to_string_pretty(&config).expect("config serializes to TOML");
+        assert!(
+            toml.contains(SENTINEL),
+            "test setup sanity: serialized TOML should contain the sentinels before masking"
+        );
+
+        let masked = mask_sensitive_fields(&toml);
+        assert!(
+            !masked.contains(SENTINEL),
+            "a secret value survived masking:\n{masked}"
+        );
+    }
 }

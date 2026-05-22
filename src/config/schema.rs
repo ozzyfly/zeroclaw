@@ -55,6 +55,39 @@ static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
     OnceLock::new();
 
+/// Canonical registry of secret-bearing configuration leaf-field names.
+///
+/// This is the single source of truth for which TOML keys hold credentials.
+/// `GET /api/config` masks the value of every key that exactly matches an
+/// entry here before returning the configuration.
+///
+/// **When adding a new secret-typed field to the schema, append its leaf name
+/// here.** A pinned static test (`secret_field_names_registry_is_pinned`) plus
+/// the masking regression test (`populated_config_serializes_with_no_unmasked_secret`)
+/// will fail in CI until this registry is updated, forcing the masking
+/// conversation into code review.
+pub const SECRET_FIELD_NAMES: &[&str] = &[
+    "api_key",
+    "bot_token",
+    "access_token",
+    "secret",
+    "app_secret",
+    "signing_secret",
+    "server_password",
+    "nickserv_password",
+    "sasl_password",
+    "encrypt_key",
+    "verification_token",
+    "api_token",
+    "app_token",
+    "brave_api_key",
+];
+
+/// Returns true if `key` is the exact name of a secret-bearing config field.
+pub fn is_secret_field(key: &str) -> bool {
+    SECRET_FIELD_NAMES.contains(&key)
+}
+
 // ── Top-level config ──────────────────────────────────────────────
 
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
@@ -4420,6 +4453,46 @@ mod tests {
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
+
+    // ── Secret-field registry ────────────────────────────────
+
+    #[test]
+    async fn secret_field_names_registry_is_pinned() {
+        // Pins the canonical registry. A newly added secret-typed config
+        // field must be appended here (and thus masked); this static check
+        // forces that conversation in code review / CI.
+        let expected: &[&str] = &[
+            "api_key",
+            "bot_token",
+            "access_token",
+            "secret",
+            "app_secret",
+            "signing_secret",
+            "server_password",
+            "nickserv_password",
+            "sasl_password",
+            "encrypt_key",
+            "verification_token",
+            "api_token",
+            "app_token",
+            "brave_api_key",
+        ];
+        assert_eq!(
+            SECRET_FIELD_NAMES, expected,
+            "secret-field registry drifted — update masking + this pin together"
+        );
+    }
+
+    #[test]
+    async fn secret_field_names_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for name in SECRET_FIELD_NAMES {
+            assert!(
+                seen.insert(*name),
+                "duplicate entry in SECRET_FIELD_NAMES: {name}"
+            );
+        }
+    }
 
     // ── Defaults ─────────────────────────────────────────────
 

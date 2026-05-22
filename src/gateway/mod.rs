@@ -2642,4 +2642,140 @@ mod tests {
         // Should be allowed again
         assert!(limiter.allow("burst-ip"));
     }
+
+    // ── /api/* auth hardening (C1) ───────────────────────────────
+
+    /// Build a minimal `AppState` wired to the given `PairingGuard`.
+    fn api_auth_test_state(pairing: PairingGuard) -> AppState {
+        AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(pairing),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        }
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn mutating_route_rejected_without_token_when_pairing_disabled() {
+        // require_pairing=false but a token exists: strict routes still require it.
+        let state = api_auth_test_state(PairingGuard::new(false, &["zc_known".into()]));
+
+        let doctor = crate::gateway::api::handle_api_doctor(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(
+            doctor.status(),
+            StatusCode::UNAUTHORIZED,
+            "POST /api/doctor must reject missing token even with pairing disabled"
+        );
+
+        let config_put = crate::gateway::api::handle_api_config_put(
+            State(state),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            config_put.status(),
+            StatusCode::UNAUTHORIZED,
+            "PUT /api/config must reject missing token even with pairing disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_route_accessible_without_token_when_pairing_disabled() {
+        let state = api_auth_test_state(PairingGuard::new(false, &["zc_known".into()]));
+
+        let status = crate::gateway::api::handle_api_status(State(state), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(
+            status.status(),
+            StatusCode::OK,
+            "GET /api/status must remain token-free when pairing is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_route_accepted_with_valid_token_when_pairing_disabled() {
+        let guard = PairingGuard::new(false, &[]);
+        let code = guard
+            .pairing_code()
+            .expect("code minted with empty token set");
+        let token = guard
+            .try_pair(&code, "test_client")
+            .await
+            .unwrap()
+            .expect("pairing should succeed with the minted code");
+        let state = api_auth_test_state(guard);
+
+        let doctor = crate::gateway::api::handle_api_doctor(State(state), bearer_headers(&token))
+            .await
+            .into_response();
+        assert_eq!(
+            doctor.status(),
+            StatusCode::OK,
+            "POST /api/doctor must succeed with a valid bearer token"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_route_rejected_when_no_token_exists() {
+        // Empty token set: strict path must fail closed and point the caller to /pair.
+        let state = api_auth_test_state(PairingGuard::new(false, &[]));
+
+        let doctor = crate::gateway::api::handle_api_doctor(State(state), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(doctor.status(), StatusCode::UNAUTHORIZED);
+
+        let body = doctor.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            err.to_lowercase().contains("pair"),
+            "error must direct the caller to pair first, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_route_rejected_with_invalid_token() {
+        let state = api_auth_test_state(PairingGuard::new(false, &["zc_known".into()]));
+
+        let doctor =
+            crate::gateway::api::handle_api_doctor(State(state), bearer_headers("zc_wrong"))
+                .await
+                .into_response();
+        assert_eq!(doctor.status(), StatusCode::UNAUTHORIZED);
+    }
 }

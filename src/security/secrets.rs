@@ -167,62 +167,108 @@ impl SecretStore {
         value.starts_with("enc2:")
     }
 
+    /// Read and decode the existing key file.
+    fn read_key(&self) -> Result<Vec<u8>> {
+        let hex_key =
+            fs::read_to_string(&self.key_path).context("Failed to read secret key file")?;
+        hex_decode(hex_key.trim()).context("Secret key file is corrupt")
+    }
+
     /// Load the encryption key from disk, or create one if it doesn't exist.
     fn load_or_create_key(&self) -> Result<Vec<u8>> {
         if self.key_path.exists() {
-            let hex_key =
-                fs::read_to_string(&self.key_path).context("Failed to read secret key file")?;
-            hex_decode(hex_key.trim()).context("Secret key file is corrupt")
-        } else {
-            let key = generate_random_key();
-            if let Some(parent) = self.key_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&self.key_path, hex_encode(&key))
-                .context("Failed to write secret key file")?;
+            return self.read_key();
+        }
 
-            // Set restrictive permissions
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&self.key_path, fs::Permissions::from_mode(0o600))
-                    .context("Failed to set key file permissions")?;
-            }
-            #[cfg(windows)]
-            {
-                // On Windows, use icacls to restrict permissions to current user only
-                let username = std::env::var("USERNAME").unwrap_or_default();
-                let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
-                    tracing::warn!(
-                        "USERNAME environment variable is empty; \
-                         cannot restrict key file permissions via icacls"
-                    );
-                    return Ok(key);
-                };
+        let key = generate_random_key();
+        if let Some(parent) = self.key_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
 
-                match std::process::Command::new("icacls")
-                    .arg(&self.key_path)
-                    .args(["/inheritance:r", "/grant:r"])
-                    .arg(grant_arg)
-                    .output()
-                {
-                    Ok(o) if !o.status.success() => {
-                        tracing::warn!(
-                            "Failed to set key file permissions via icacls (exit code {:?})",
-                            o.status.code()
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("Could not set key file permissions: {e}");
-                    }
-                    _ => {
-                        tracing::debug!("Key file permissions restricted via icacls");
-                    }
+        // Create the key file atomically with owner-only (0600) permissions
+        // so it is never world-readable, not even briefly. `create_new`
+        // (O_CREAT|O_EXCL) also guarantees we never clobber an existing file
+        // due to a TOCTOU race against the `exists()` check above. If a
+        // concurrent process wins that race, `create_new` fails with
+        // `AlreadyExists` — in which case we load the key the winner wrote
+        // rather than failing the caller.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&self.key_path)
+            {
+                Ok(mut file) => {
+                    file.write_all(hex_encode(&key).as_bytes())
+                        .context("Failed to write secret key file")?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A concurrent creator won the race — use its key.
+                    return self.read_key();
+                }
+                Err(e) => {
+                    return Err(e).context("Failed to create secret key file");
                 }
             }
-
-            Ok(key)
         }
+        #[cfg(not(unix))]
+        {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.key_path)
+            {
+                Ok(_) => {
+                    fs::write(&self.key_path, hex_encode(&key))
+                        .context("Failed to write secret key file")?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return self.read_key();
+                }
+                Err(e) => {
+                    return Err(e).context("Failed to create secret key file");
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            // On Windows, use icacls to restrict permissions to current user only
+            let username = std::env::var("USERNAME").unwrap_or_default();
+            let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
+                tracing::warn!(
+                    "USERNAME environment variable is empty; \
+                     cannot restrict key file permissions via icacls"
+                );
+                return Ok(key);
+            };
+
+            match std::process::Command::new("icacls")
+                .arg(&self.key_path)
+                .args(["/inheritance:r", "/grant:r"])
+                .arg(grant_arg)
+                .output()
+            {
+                Ok(o) if !o.status.success() => {
+                    tracing::warn!(
+                        "Failed to set key file permissions via icacls (exit code {:?})",
+                        o.status.code()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Could not set key file permissions: {e}");
+                }
+                _ => {
+                    tracing::debug!("Key file permissions restricted via icacls");
+                }
+            }
+        }
+
+        Ok(key)
     }
 }
 
@@ -847,5 +893,33 @@ mod tests {
             0o600,
             "Key file must be owner-only (0600)"
         );
+    }
+
+    /// The key file must be `0600` from the moment it exists — created
+    /// atomically, with no write-then-chmod window during which it is
+    /// world-readable. Pins the M3 hardening invariant.
+    #[cfg(unix)]
+    #[test]
+    fn key_file_created_atomically_with_owner_only_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        assert!(!store.key_path.exists(), "key file should not pre-exist");
+
+        // First call creates the key file.
+        let key = store.load_or_create_key().unwrap();
+        assert_eq!(key.len(), KEY_LEN);
+
+        let mode = fs::metadata(&store.key_path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "newly created key file must be owner-only (0600), got {:o}",
+            mode & 0o777
+        );
+
+        // A second call must load the same key, not recreate/overwrite it.
+        let key_again = store.load_or_create_key().unwrap();
+        assert_eq!(key, key_again, "existing key file must be reused as-is");
     }
 }
