@@ -41,11 +41,12 @@ static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)bearer",
         r"(?i)credential",
     ])
-    .unwrap()
+    .expect("static SENSITIVE_KEY_PATTERNS regex set")
 });
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#)
+        .expect("static SENSITIVE_KV_REGEX")
 });
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.

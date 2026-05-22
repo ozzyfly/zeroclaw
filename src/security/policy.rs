@@ -774,6 +774,11 @@ impl SecurityPolicy {
     }
 
     /// Check for dangerous arguments that allow sub-command execution.
+    ///
+    /// Best-effort defense-in-depth only: this denylist covers the common
+    /// `find -exec`/`-ok` and `git config`/`alias`/`-c` vectors but is not
+    /// exhaustive. The command allowlist is the primary control — do not
+    /// rely on this check as a sole gate.
     fn is_args_safe(&self, base: &str, args: &[String]) -> bool {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
