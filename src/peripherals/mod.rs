@@ -24,8 +24,6 @@ pub mod uno_q_setup;
 #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
 pub mod rpi;
 
-pub use traits::Peripheral;
-
 use crate::config::{Config, PeripheralBoardConfig, PeripheralsConfig};
 #[cfg(feature = "hardware")]
 use crate::tools::HardwareMemoryMapTool;
@@ -227,7 +225,10 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
     Ok(tools)
 }
 
+// `async` is kept to mirror the `hardware`-feature variant's signature so
+// callers (`agent/loop_.rs`) can `.await` it regardless of feature flags.
 #[cfg(not(feature = "hardware"))]
+#[allow(clippy::unused_async)]
 pub async fn create_peripheral_tools(_config: &PeripheralsConfig) -> Result<Vec<Box<dyn Tool>>> {
     Ok(Vec::new())
 }

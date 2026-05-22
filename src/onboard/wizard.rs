@@ -1792,7 +1792,7 @@ fn resolve_interactive_onboarding_mode(
             "  Existing config found at {}. Select setup mode",
             config_path.display()
         ))
-        .items(&options)
+        .items(options)
         .default(1)
         .interact()?;
 
@@ -5492,12 +5492,15 @@ fn print_summary(config: &Config) {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+    use tokio::sync::Mutex as AsyncMutex;
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    /// Async-aware mutex so the guard can be safely held across `.await`
+    /// points while env vars are mutated for the duration of a test.
+    fn env_lock() -> &'static AsyncMutex<()> {
+        static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| AsyncMutex::new(()))
     }
 
     struct EnvVarGuard {
@@ -5577,7 +5580,7 @@ mod tests {
         apply_provider_update(
             &mut config,
             "anthropic".to_string(),
-            "".to_string(),
+            String::new(),
             "claude-sonnet-4-5-20250929".to_string(),
             None,
         );
@@ -5698,7 +5701,7 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_respects_zero_claw_workspace_env_layout() {
-        let _env_guard = env_lock().lock().unwrap();
+        let _env_guard = env_lock().lock().await;
         let tmp = TempDir::new().unwrap();
         let workspace_root = tmp.path().join("zeroclaw-data");
         let workspace_dir = workspace_root.join("workspace");
