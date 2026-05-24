@@ -517,7 +517,7 @@ Cloud API mode (Meta webhook):
 | `access_token` | Yes | Meta Cloud API bearer token |
 | `phone_number_id` | Yes | Meta phone number ID |
 | `verify_token` | Yes | Webhook verification token |
-| `app_secret` | Optional | Enables webhook signature verification (`X-Hub-Signature-256`) |
+| `app_secret` | Required for webhook | Enables HMAC signature verification (`X-Hub-Signature-256`). **Fail-closed:** without this, `POST /whatsapp` is unregistered (HTTP `405`; Meta `GET /whatsapp` handshake still served) and a startup `WARN` is emitted. Overridable via `ZEROCLAW_WHATSAPP_APP_SECRET`. |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
 
 WhatsApp Web mode (native client):
@@ -542,7 +542,7 @@ Linq Partner V3 API integration for iMessage, RCS, and SMS.
 |---|---|---|
 | `api_token` | Yes | Linq Partner API bearer token |
 | `from_phone` | Yes | Phone number to send from (E.164 format) |
-| `signing_secret` | Optional | Webhook signing secret for HMAC-SHA256 signature verification |
+| `signing_secret` | Required for webhook | HMAC-SHA256 signing secret. **Fail-closed:** without this, `POST /linq` is unregistered (HTTP `404`) and a startup `WARN` is emitted. Overridable via `ZEROCLAW_LINQ_SIGNING_SECRET`. |
 | `allowed_senders` | Recommended | Allowed inbound phone numbers (`[]` = deny all, `"*"` = allow all) |
 
 Notes:
@@ -560,7 +560,7 @@ Native Nextcloud Talk bot integration (webhook receive + OCS send API).
 |---|---|---|
 | `base_url` | Yes | Nextcloud base URL (e.g. `https://cloud.example.com`) |
 | `app_token` | Yes | Bot app token used for OCS bearer auth |
-| `webhook_secret` | Optional | Enables webhook signature verification |
+| `webhook_secret` | Required for webhook | Enables webhook signature verification. **Fail-closed:** without this, `POST /nextcloud-talk` is unregistered (HTTP `404`) and a startup `WARN` is emitted. Overridable via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`. |
 | `allowed_users` | Recommended | Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all) |
 
 Notes:

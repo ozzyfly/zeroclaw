@@ -622,22 +622,82 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         event_tx,
     };
 
+    // Build router with middleware
+    let app = build_gateway_router(state);
+
+    // Run the server
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Build the gateway router from a fully-populated [`AppState`].
+///
+/// Channel webhook POST routes (`/whatsapp`, `/linq`, `/nextcloud-talk`) are
+/// **fail-closed**: each route is registered only when both its channel and its
+/// signing secret are configured. When a channel is configured without its
+/// signing secret, the route is left unregistered (requests to it receive `404`)
+/// and a startup `WARN` is emitted. This guarantees that no unsigned, unverified
+/// request body can ever reach tool execution via `run_gateway_chat_with_tools`.
+fn build_gateway_router(state: AppState) -> Router {
     // Config PUT needs larger body limit (1MB)
     let config_put_router = Router::new()
         .route("/api/config", put(api::handle_api_config_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
 
-    // Build router with middleware
-    let app = Router::new()
+    let mut app = Router::new()
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
-        .route("/webhook", post(handle_webhook))
-        .route("/whatsapp", get(handle_whatsapp_verify))
-        .route("/whatsapp", post(handle_whatsapp_message))
-        .route("/linq", post(handle_linq_webhook))
-        .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        .route("/webhook", post(handle_webhook));
+
+    // ── Channel webhook routes (fail-closed: require a signing secret) ──
+    // GET /whatsapp is the Meta verification handshake — it never reaches tool
+    // execution, so it stays gated on channel configuration alone.
+    if state.whatsapp.is_some() {
+        app = app.route("/whatsapp", get(handle_whatsapp_verify));
+        if state.whatsapp_app_secret.is_some() {
+            app = app.route("/whatsapp", post(handle_whatsapp_message));
+        } else {
+            tracing::warn!(
+                "WhatsApp channel is configured without an app secret — \
+                 the POST /whatsapp webhook route is disabled (fail-closed). \
+                 Set ZEROCLAW_WHATSAPP_APP_SECRET or [channels_config.whatsapp].app_secret to enable it."
+            );
+        }
+    }
+
+    if state.linq.is_some() {
+        if state.linq_signing_secret.is_some() {
+            app = app.route("/linq", post(handle_linq_webhook));
+        } else {
+            tracing::warn!(
+                "Linq channel is configured without a signing secret — \
+                 the POST /linq webhook route is disabled (fail-closed). \
+                 Set ZEROCLAW_LINQ_SIGNING_SECRET or [channels_config.linq].signing_secret to enable it."
+            );
+        }
+    }
+
+    if state.nextcloud_talk.is_some() {
+        if state.nextcloud_talk_webhook_secret.is_some() {
+            app = app.route("/nextcloud-talk", post(handle_nextcloud_talk_webhook));
+        } else {
+            tracing::warn!(
+                "Nextcloud Talk channel is configured without a webhook secret — \
+                 the POST /nextcloud-talk webhook route is disabled (fail-closed). \
+                 Set ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET or \
+                 [channels_config.nextcloud_talk].webhook_secret to enable it."
+            );
+        }
+    }
+
+    app
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))
@@ -668,16 +728,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ))
         // ── SPA fallback: non-API GET requests serve index.html ──
-        .fallback(get(static_files::handle_spa_fallback));
-
-    // Run the server
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-
-    Ok(())
+        .fallback(get(static_files::handle_spa_fallback))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1103,27 +1154,42 @@ async fn handle_whatsapp_message(
         );
     };
 
-    // ── Security: Verify X-Hub-Signature-256 if app_secret is configured ──
-    if let Some(ref app_secret) = state.whatsapp_app_secret {
-        let signature = headers
-            .get("X-Hub-Signature-256")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    // ── Security: signature verification is unconditional ──
+    // Router-level fail-closed registration (see `build_gateway_router`)
+    // guarantees this handler is reached only when `whatsapp_app_secret`
+    // is `Some`. The defensive `None` branch below is unreachable in
+    // practice and returns 503 without touching tool execution, in case
+    // route registration and handler ever drift out of sync.
+    let Some(ref app_secret) = state.whatsapp_app_secret else {
+        tracing::error!(
+            "BUG: handle_whatsapp_message reached without an app secret — \
+             this should be impossible because `build_gateway_router` registers \
+             POST /whatsapp only when the secret is configured (fail-closed)."
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "WhatsApp webhook misconfigured"})),
+        );
+    };
 
-        if !verify_whatsapp_signature(app_secret, &body, signature) {
-            tracing::warn!(
-                "WhatsApp webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
+    let signature = headers
+        .get("X-Hub-Signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !verify_whatsapp_signature(app_secret, &body, signature) {
+        tracing::warn!(
+            "WhatsApp webhook signature verification failed (signature: {})",
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
     }
 
     // Parse JSON body
@@ -1200,37 +1266,51 @@ async fn handle_linq_webhook(
 
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
-    if let Some(ref signing_secret) = state.linq_signing_secret {
-        let timestamp = headers
-            .get("X-Webhook-Timestamp")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    // ── Security: signature verification is unconditional ──
+    // Router-level fail-closed registration (see `build_gateway_router`)
+    // guarantees this handler is reached only when `linq_signing_secret`
+    // is `Some`. The defensive `None` branch returns 503 without
+    // touching tool execution.
+    let Some(ref signing_secret) = state.linq_signing_secret else {
+        tracing::error!(
+            "BUG: handle_linq_webhook reached without a signing secret — \
+             this should be impossible because `build_gateway_router` registers \
+             POST /linq only when the secret is configured (fail-closed)."
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Linq webhook misconfigured"})),
+        );
+    };
 
-        let signature = headers
-            .get("X-Webhook-Signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    let timestamp = headers
+        .get("X-Webhook-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
-        if !crate::channels::linq::verify_linq_signature(
-            signing_secret,
-            &body_str,
-            timestamp,
-            signature,
-        ) {
-            tracing::warn!(
-                "Linq webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
+    let signature = headers
+        .get("X-Webhook-Signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !crate::channels::linq::verify_linq_signature(
+        signing_secret,
+        &body_str,
+        timestamp,
+        signature,
+    ) {
+        tracing::warn!(
+            "Linq webhook signature verification failed (signature: {})",
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
     }
 
     // Parse JSON body
@@ -1308,37 +1388,51 @@ async fn handle_nextcloud_talk_webhook(
 
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
-    if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
-        let random = headers
-            .get("X-Nextcloud-Talk-Random")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    // ── Security: signature verification is unconditional ──
+    // Router-level fail-closed registration (see `build_gateway_router`)
+    // guarantees this handler is reached only when
+    // `nextcloud_talk_webhook_secret` is `Some`. The defensive `None`
+    // branch returns 503 without touching tool execution.
+    let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret else {
+        tracing::error!(
+            "BUG: handle_nextcloud_talk_webhook reached without a webhook secret — \
+             this should be impossible because `build_gateway_router` registers \
+             POST /nextcloud-talk only when the secret is configured (fail-closed)."
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Nextcloud Talk webhook misconfigured"})),
+        );
+    };
 
-        let signature = headers
-            .get("X-Nextcloud-Talk-Signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    let random = headers
+        .get("X-Nextcloud-Talk-Random")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
-        if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
-            webhook_secret,
-            random,
-            &body_str,
-            signature,
-        ) {
-            tracing::warn!(
-                "Nextcloud Talk webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
+    let signature = headers
+        .get("X-Nextcloud-Talk-Signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
+        webhook_secret,
+        random,
+        &body_str,
+        signature,
+    ) {
+        tracing::warn!(
+            "Nextcloud Talk webhook signature verification failed (signature: {})",
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
     }
 
     // Parse JSON body
@@ -2641,5 +2735,495 @@ mod tests {
 
         // Should be allowed again
         assert!(limiter.allow("burst-ip"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Fail-closed webhook routes (gateway-webhook-fail-closed)
+    // ──────────────────────────────────────────────────────────────────────────
+    //
+    // These tests prove the M4 contract end-to-end at the router level:
+    //
+    //   • channel configured + signing secret missing  →  route is unregistered
+    //     (HTTP 404) and the request body never reaches `run_gateway_chat_with_tools`.
+    //   • channel configured + signing secret present + valid signature  →  HTTP 200.
+    //   • channel configured + signing secret present + invalid/missing signature
+    //     →  HTTP 401 and the body never reaches tool execution.
+    //
+    // The `MockProvider::calls` counter is the proof that an unsigned body never
+    // reaches the LLM/tool path: any non-zero count after a fail-closed request
+    // would indicate the body was processed.
+
+    use axum::body::Body as AxumBody;
+    use axum::http::Request;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use tower::ServiceExt as _;
+
+    fn build_state_with_provider(
+        provider_impl: Arc<MockProvider>,
+        whatsapp: Option<Arc<WhatsAppChannel>>,
+        whatsapp_app_secret: Option<Arc<str>>,
+        linq: Option<Arc<LinqChannel>>,
+        linq_signing_secret: Option<Arc<str>>,
+        nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+        nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    ) -> AppState {
+        let provider: Arc<dyn Provider> = provider_impl;
+        AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp,
+            whatsapp_app_secret,
+            linq,
+            linq_signing_secret,
+            nextcloud_talk,
+            nextcloud_talk_webhook_secret,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        }
+    }
+
+    fn whatsapp_test_channel() -> Arc<WhatsAppChannel> {
+        Arc::new(WhatsAppChannel::new(
+            "test-access-token".into(),
+            "test-endpoint-id".into(),
+            "test-verify-token".into(),
+            vec!["*".into()],
+        ))
+    }
+
+    fn linq_test_channel() -> Arc<LinqChannel> {
+        Arc::new(LinqChannel::new(
+            "test-api-token".into(),
+            "+15551234567".into(),
+            vec!["*".into()],
+        ))
+    }
+
+    fn nextcloud_talk_test_channel() -> Arc<NextcloudTalkChannel> {
+        Arc::new(NextcloudTalkChannel::new(
+            "https://nc.example.com".into(),
+            "test-app-token".into(),
+            vec!["*".into()],
+        ))
+    }
+
+    fn compute_linq_signature(secret: &str, timestamp: &str, body: &str) -> String {
+        let message = format!("{timestamp}.{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(message.as_bytes());
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn compute_nextcloud_talk_signature(secret: &str, random: &str, body: &str) -> String {
+        let payload = format!("{random}{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    // ── WhatsApp ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn whatsapp_webhook_route_unregistered_without_app_secret_is_fail_closed() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            Some(whatsapp_test_channel()),
+            None, // ← no app secret → POST route MUST NOT be registered
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/whatsapp")
+            .header("content-type", "application/json")
+            .body(AxumBody::from(r#"{"entry":[]}"#))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        // Spec: POST route absent → HTTP 4xx; the body MUST NOT reach tool
+        // execution. axum returns 405 here because the Meta verification
+        // `GET /whatsapp` handshake stays registered (per design), so the
+        // path exists but POST does not.
+        assert!(
+            response.status().is_client_error(),
+            "expected 4xx, got {}",
+            response.status()
+        );
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn whatsapp_webhook_accepts_valid_signature_when_secret_configured() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let app_secret = generate_test_secret();
+        let body = r#"{"entry":[]}"#; // empty entry list — channel acks without invoking LLM
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body.as_bytes());
+
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            Some(whatsapp_test_channel()),
+            Some(Arc::from(app_secret.as_str())),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/whatsapp")
+            .header("content-type", "application/json")
+            .header("X-Hub-Signature-256", signature_header)
+            .body(AxumBody::from(body))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn whatsapp_webhook_rejects_invalid_signature_when_secret_configured() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let app_secret = generate_test_secret();
+        let body = r#"{"entry":[]}"#;
+
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            Some(whatsapp_test_channel()),
+            Some(Arc::from(app_secret.as_str())),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let app = build_gateway_router(state);
+
+        // Wrong signature
+        let bad_sig = format!("sha256={}", "00".repeat(32));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/whatsapp")
+            .header("content-type", "application/json")
+            .header("X-Hub-Signature-256", bad_sig)
+            .body(AxumBody::from(body))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn whatsapp_webhook_rejects_missing_signature_when_secret_configured() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let app_secret = generate_test_secret();
+        let body = r#"{"entry":[]}"#;
+
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            Some(whatsapp_test_channel()),
+            Some(Arc::from(app_secret.as_str())),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/whatsapp")
+            .header("content-type", "application/json")
+            .body(AxumBody::from(body))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ── Linq ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn linq_webhook_route_unregistered_without_signing_secret_is_fail_closed() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            None,
+            None,
+            Some(linq_test_channel()),
+            None, // ← no signing secret → route MUST NOT be registered
+            None,
+            None,
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/linq")
+            .header("content-type", "application/json")
+            .body(AxumBody::from(r#"{"messages":[]}"#))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        // Spec: POST route absent → HTTP 4xx; body MUST NOT reach tool execution.
+        assert!(
+            response.status().is_client_error(),
+            "expected 4xx, got {}",
+            response.status()
+        );
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn linq_webhook_accepts_valid_signature_when_secret_configured() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let signing_secret = generate_test_secret();
+        let body = r#"{"messages":[]}"#;
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let signature = compute_linq_signature(&signing_secret, &timestamp, body);
+
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            None,
+            None,
+            Some(linq_test_channel()),
+            Some(Arc::from(signing_secret.as_str())),
+            None,
+            None,
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/linq")
+            .header("content-type", "application/json")
+            .header("X-Webhook-Timestamp", timestamp)
+            .header("X-Webhook-Signature", signature)
+            .body(AxumBody::from(body))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn linq_webhook_rejects_invalid_signature_when_secret_configured() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let signing_secret = generate_test_secret();
+        let body = r#"{"messages":[]}"#;
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            None,
+            None,
+            Some(linq_test_channel()),
+            Some(Arc::from(signing_secret.as_str())),
+            None,
+            None,
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/linq")
+            .header("content-type", "application/json")
+            .header("X-Webhook-Timestamp", timestamp)
+            .header("X-Webhook-Signature", format!("sha256={}", "00".repeat(32)))
+            .body(AxumBody::from(body))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn linq_webhook_rejects_missing_signature_when_secret_configured() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let signing_secret = generate_test_secret();
+        let body = r#"{"messages":[]}"#;
+
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            None,
+            None,
+            Some(linq_test_channel()),
+            Some(Arc::from(signing_secret.as_str())),
+            None,
+            None,
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/linq")
+            .header("content-type", "application/json")
+            .body(AxumBody::from(body))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ── Nextcloud Talk ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_route_unregistered_without_webhook_secret_is_fail_closed() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(nextcloud_talk_test_channel()),
+            None, // ← no webhook secret → route MUST NOT be registered
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/nextcloud-talk")
+            .header("content-type", "application/json")
+            .body(AxumBody::from(r#"{}"#))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        // Spec: POST route absent → HTTP 4xx; body MUST NOT reach tool execution.
+        assert!(
+            response.status().is_client_error(),
+            "expected 4xx, got {}",
+            response.status()
+        );
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_accepts_valid_signature_when_secret_configured() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let webhook_secret = generate_test_secret();
+        let body = r#"{}"#; // empty payload → channel acks without invoking LLM
+        let random = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let signature = compute_nextcloud_talk_signature(&webhook_secret, random, body);
+
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(nextcloud_talk_test_channel()),
+            Some(Arc::from(webhook_secret.as_str())),
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/nextcloud-talk")
+            .header("content-type", "application/json")
+            .header("X-Nextcloud-Talk-Random", random)
+            .header("X-Nextcloud-Talk-Signature", signature)
+            .body(AxumBody::from(body))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rejects_invalid_signature_when_secret_configured() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let webhook_secret = generate_test_secret();
+        let body = r#"{}"#;
+        let random = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(nextcloud_talk_test_channel()),
+            Some(Arc::from(webhook_secret.as_str())),
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/nextcloud-talk")
+            .header("content-type", "application/json")
+            .header("X-Nextcloud-Talk-Random", random)
+            .header(
+                "X-Nextcloud-Talk-Signature",
+                format!("sha256={}", "00".repeat(32)),
+            )
+            .body(AxumBody::from(body))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rejects_missing_signature_when_secret_configured() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let webhook_secret = generate_test_secret();
+        let body = r#"{}"#;
+
+        let state = build_state_with_provider(
+            provider_impl.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(nextcloud_talk_test_channel()),
+            Some(Arc::from(webhook_secret.as_str())),
+        );
+
+        let app = build_gateway_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/nextcloud-talk")
+            .header("content-type", "application/json")
+            .body(AxumBody::from(body))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 }

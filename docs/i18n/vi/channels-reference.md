@@ -220,9 +220,11 @@ Chế độ Cloud API:
 access_token = "EAAB..."
 phone_number_id = "123456789012345"
 verify_token = "your-verify-token"
-app_secret = "your-app-secret"     # tùy chọn nhưng được khuyến nghị
+app_secret = "your-app-secret"     # BẮT BUỘC để nhận webhook (fail-closed)
 allowed_numbers = ["*"]
 ```
+
+> **BREAKING (bảo mật):** Kể từ thay đổi `gateway-webhook-fail-closed`, route `POST /whatsapp` chỉ được đăng ký khi `app_secret` (hoặc `ZEROCLAW_WHATSAPP_APP_SECRET`) đã thiết lập. Nếu không, route không tồn tại và gateway trả về HTTP `405` cho POST đến (handshake xác minh `GET /whatsapp` của Meta vẫn hoạt động); một dòng `WARN` được phát ra khi khởi động chỉ rõ route bị tắt. Đặt secret để khôi phục việc nhận webhook.
 
 Chế độ WhatsApp Web:
 

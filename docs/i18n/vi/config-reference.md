@@ -418,7 +418,7 @@ Chế độ Cloud API (webhook Meta):
 | `access_token` | Có | Bearer token Meta Cloud API |
 | `phone_number_id` | Có | ID số điện thoại Meta |
 | `verify_token` | Có | Token xác minh webhook |
-| `app_secret` | Tùy chọn | Bật xác minh chữ ký webhook (`X-Hub-Signature-256`) |
+| `app_secret` | Bắt buộc cho webhook | Bật xác minh HMAC (`X-Hub-Signature-256`). **Fail-closed:** thiếu khóa này thì `POST /whatsapp` không được đăng ký (HTTP `405`; handshake `GET /whatsapp` của Meta vẫn được phục vụ) và một `WARN` được phát ra khi khởi động. Có thể ghi đè qua `ZEROCLAW_WHATSAPP_APP_SECRET`. |
 | `allowed_numbers` | Khuyến nghị | Số điện thoại cho phép gửi đến (`[]` = từ chối tất cả, `"*"` = cho phép tất cả) |
 
 Chế độ WhatsApp Web (client gốc):

@@ -236,9 +236,11 @@ Cloud API mode:
 access_token = "EAAB..."
 phone_number_id = "123456789012345"
 verify_token = "your-verify-token"
-app_secret = "your-app-secret"     # optional but recommended
+app_secret = "your-app-secret"     # REQUIRED for webhook delivery (fail-closed)
 allowed_numbers = ["*"]
 ```
+
+> **BREAKING (security):** As of the `gateway-webhook-fail-closed` change, the `POST /whatsapp` webhook route is registered only when `app_secret` (or `ZEROCLAW_WHATSAPP_APP_SECRET`) is set. Without it, the route is unregistered and the gateway responds with HTTP `405` to inbound POSTs (the Meta verification `GET /whatsapp` handshake stays available). A startup `WARN` is emitted naming the disabled route. Set the secret to restore webhook delivery.
 
 WhatsApp Web mode:
 
@@ -372,7 +374,7 @@ allowed_users = ["*"]
 [channels_config.nextcloud_talk]
 base_url = "https://cloud.example.com"
 app_token = "nextcloud-talk-app-token"
-webhook_secret = "optional-webhook-secret"  # optional but recommended
+webhook_secret = "your-webhook-secret"  # REQUIRED for webhook delivery (fail-closed)
 allowed_users = ["*"]
 ```
 
@@ -380,7 +382,7 @@ Notes:
 
 - Inbound webhook endpoint: `POST /nextcloud-talk`.
 - Signature verification uses `X-Nextcloud-Talk-Random` and `X-Nextcloud-Talk-Signature`.
-- If `webhook_secret` is set, invalid signatures are rejected with `401`.
+- **Fail-closed:** the `POST /nextcloud-talk` route is registered only when `webhook_secret` (or `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`) is set. Without it, the route is unregistered and the gateway responds with HTTP `404`/`405` to inbound POSTs and emits a startup `WARN`. With the secret set, signature verification is unconditional and invalid signatures are rejected with `401`.
 - `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
 - See [nextcloud-talk-setup.md](./nextcloud-talk-setup.md) for a full runbook.
 
@@ -390,7 +392,7 @@ Notes:
 [channels_config.linq]
 api_token = "linq-partner-api-token"
 from_phone = "+15551234567"
-signing_secret = "optional-webhook-signing-secret"  # optional but recommended
+signing_secret = "your-webhook-signing-secret"  # REQUIRED for webhook delivery (fail-closed)
 allowed_senders = ["*"]
 ```
 
@@ -399,7 +401,7 @@ Notes:
 - Linq uses the Partner V3 API for iMessage, RCS, and SMS.
 - Inbound webhook endpoint: `POST /linq`.
 - Signature verification uses `X-Webhook-Signature` (HMAC-SHA256) and `X-Webhook-Timestamp`.
-- If `signing_secret` is set, invalid or stale (>300s) signatures are rejected.
+- **Fail-closed:** the `POST /linq` route is registered only when `signing_secret` (or `ZEROCLAW_LINQ_SIGNING_SECRET`) is set. Without it, the route is unregistered and the gateway responds with HTTP `404`/`405` to inbound POSTs and emits a startup `WARN`. With the secret set, signature verification is unconditional; invalid or stale (>300s) signatures are rejected with `401`.
 - `ZEROCLAW_LINQ_SIGNING_SECRET` overrides config secret.
 - `allowed_senders` uses E.164 phone number format (e.g. `+1234567890`).
 

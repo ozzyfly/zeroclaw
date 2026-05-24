@@ -225,6 +225,8 @@ panic = "abort"
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
+# Enables `ServiceExt::oneshot` for in-process axum router integration tests.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [[bench]]
 name = "agent_benchmarks"
