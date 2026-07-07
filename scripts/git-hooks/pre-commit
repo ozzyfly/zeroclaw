@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Pre-commit secret scan — gitleaks 優先，無則用 grep fallback
+set -uo pipefail
+GITLEAKS=""
+for c in gitleaks /opt/homebrew/bin/gitleaks /usr/local/bin/gitleaks; do
+  command -v "$c" >/dev/null 2>&1 && { GITLEAKS="$c"; break; }
+done
+if [ -n "$GITLEAKS" ]; then
+  "$GITLEAKS" protect --staged --no-banner || { echo "❌ gitleaks 偵測到疑似機密，已擋下 commit（確認誤判可用 git commit --no-verify）"; exit 1; }
+  exit 0
+fi
+PATTERNS='github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|AIzaSy[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN (RSA|EC|OPENSSH|PGP|DSA)? ?PRIVATE KEY|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9]{24,}|sk-ant-[A-Za-z0-9_-]{24,}|eyJhbGciOi[A-Za-z0-9._-]{40,}'
+files=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$files" ] && exit 0
+fail=0
+while IFS= read -r f; do
+  case "$f" in
+    *.png|*.jpg|*.jpeg|*.gif|*.pdf|*.zip|*.tgz|*.ipa|*.mp3|*.m4a|*.db) continue;;
+    *.p8|*.pem|*.key|*id_rsa*) echo "❌ 私鑰檔被 staged：$f"; fail=1; continue;;
+  esac
+  if git show ":$f" 2>/dev/null | grep -nE "$PATTERNS" >/dev/null; then
+    echo "❌ 疑似機密出現在 staged 檔案：$f"
+    git show ":$f" | grep -noE "$PATTERNS" | head -3 | sed -E 's/^([0-9]+:.{0,12}).*/  line \1***(masked)/'
+    fail=1
+  fi
+done <<< "$files"
+if [ "$fail" = 1 ]; then
+  echo "已擋下 commit。移除機密後重試；確認誤判可用 git commit --no-verify"
+  exit 1
+fi
+exit 0
